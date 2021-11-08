@@ -48,6 +48,7 @@ limitations under the License.
 #include "tensorflow/core/lib/gtl/inlined_vector.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/platform/errors.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/protobuf.h"
@@ -452,7 +453,8 @@ struct ProtoHelper<bfloat16> {
   static void Fill(const bfloat16* data, size_t n, TensorProto* proto) {
     proto->mutable_half_val()->Reserve(n);
     for (size_t i = 0; i < n; ++i) {
-      proto->mutable_half_val()->AddAlreadyReserved(data[i].value);
+      proto->mutable_half_val()->AddAlreadyReserved(
+          Eigen::numext::bit_cast<uint16>(data[i]));
     }
   }
 };
@@ -462,7 +464,8 @@ struct ProtoHelper<Eigen::half> {
   static void Fill(const Eigen::half* data, size_t n, TensorProto* proto) {
     proto->mutable_half_val()->Reserve(n);
     for (size_t i = 0; i < n; ++i) {
-      proto->mutable_half_val()->AddAlreadyReserved(data[i].x);
+      proto->mutable_half_val()->AddAlreadyReserved(
+          Eigen::numext::bit_cast<uint16>(data[i]));
     }
   }
 };
@@ -650,6 +653,12 @@ Tensor::Tensor(DataType type, const TensorShape& shape, TensorBuffer* buf)
   RefIfNonNull(buf);
 }
 
+Tensor::Tensor(DataType type, const TensorShape& shape,
+               core::RefCountPtr<TensorBuffer> buf)
+    : shape_(shape), buf_(buf.release()) {
+  set_dtype(type);
+}
+
 bool Tensor::IsInitialized() const {
   return (buf_ != nullptr && buf_->data() != nullptr) ||
          shape_.num_elements() == 0;
@@ -711,11 +720,11 @@ bool Tensor::RefCountIsOne() const {
 // The macro CASES() expands to a switch statement conditioned on
 // TYPE_ENUM. Each case expands the STMTS after a typedef for T.
 #define SINGLE_ARG(...) __VA_ARGS__
-#define CASE(TYPE, STMTS)             \
-  case DataTypeToEnum<TYPE>::value: { \
-    typedef TYPE T;                   \
-    STMTS;                            \
-    break;                            \
+#define CASE(TYPE, STMTS)               \
+  case DataTypeToEnum<TYPE>::value: {   \
+    typedef TF_ATTRIBUTE_UNUSED TYPE T; \
+    STMTS;                              \
+    break;                              \
   }
 #define CASES_WITH_DEFAULT(TYPE_ENUM, STMTS, INVALID, DEFAULT) \
   switch (TYPE_ENUM) {                                         \
@@ -751,9 +760,8 @@ bool Tensor::RefCountIsOne() const {
   }
 
 #define CASES(TYPE_ENUM, STMTS)                                      \
-  CASES_WITH_DEFAULT(TYPE_ENUM, STMTS,                               \
-                     LOG(FATAL) << "Unexpected type: " << TYPE_ENUM; \
-                     , LOG(FATAL) << "Type not set";)
+  CASES_WITH_DEFAULT(TYPE_ENUM, STMTS, LOG(FATAL) << "Type not set"; \
+                     , LOG(FATAL) << "Unexpected type: " << TYPE_ENUM;)
 
 Tensor::Tensor(Allocator* a, DataType type, const TensorShape& shape)
     : shape_(shape), buf_(nullptr) {
@@ -781,6 +789,16 @@ Tensor::Tensor(Allocator* a, DataType type, const TensorShape& shape,
     LogMemory::RecordTensorAllocation("Unknown (with attributes)",
                                       LogMemory::UNKNOWN_STEP_ID, *this);
   }
+}
+
+Status Tensor::BuildTensor(DataType type, const TensorShape& shape,
+                           Tensor* out_tensor) {
+  // Avoid crashes due to invalid or unsupported types.
+  CASES_WITH_DEFAULT(
+      type, {}, return errors::InvalidArgument("Type not set"),
+      return errors::InvalidArgument("Unexpected type: ", DataType_Name(type)));
+  *out_tensor = Tensor(type, shape);
+  return Status::OK();
 }
 
 // NOTE(mrry): The default allocator for a Tensor (when none is specified) is

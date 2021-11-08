@@ -1287,11 +1287,12 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     CHECK_EQ(num_spatial_dims + 2, lhs_rank);
     CHECK_EQ(num_spatial_dims + 2, rhs_rank);
 
-    TF_ASSIGN_OR_RETURN(auto inferred_return_shape,
-                        ShapeInference::InferConvolveShape(
-                            lhs_shape, rhs_shape, conv->feature_group_count(),
-                            conv->batch_group_count(), window, dnums,
-                            /*preferred_element_type=*/absl::nullopt));
+    TF_ASSIGN_OR_RETURN(
+        auto inferred_return_shape,
+        ShapeInference::InferConvolveShape(
+            lhs_shape, rhs_shape, conv->feature_group_count(),
+            conv->batch_group_count(), window, dnums,
+            /*preferred_element_type=*/conv->shape().element_type()));
     CHECK(ShapeUtil::Compatible(result_shape, inferred_return_shape))
         << "return shape set to: " << ShapeUtil::HumanString(result_shape)
         << " but is inferred to be: "
@@ -1949,7 +1950,7 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
     TF_ASSIGN_OR_RETURN(
         auto inferred_return_shape,
         ShapeInference::InferReduceWindowShape(
-            reduce_window_instr->input_array_shapes(),
+            reduce_window_instr->input_shapes(),
             reduce_window_instr->init_value_shapes(), window,
             /*to_apply_shape=*/function->ComputeProgramShape()));
     TF_RET_CHECK(
@@ -1960,7 +1961,7 @@ class HloEvaluatorTypedVisitor : public DfsHloVisitorWithDefault {
         << ShapeUtil::HumanStringWithLayout(inferred_return_shape);
 
     absl::InlinedVector<const Literal*, 2> input_literal_vec, init_literal_vec;
-    auto input_arrays = reduce_window_instr->input_arrays();
+    auto input_arrays = reduce_window_instr->inputs();
     auto init_values = reduce_window_instr->init_values();
     int64 num_args = input_arrays.size();
     for (int i = 0; i < num_args; ++i) {

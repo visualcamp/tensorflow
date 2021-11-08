@@ -21,13 +21,14 @@ import os
 import shutil
 
 from absl.testing import parameterized
+import numpy as np
 
 from tensorflow.python.data.experimental.ops import io
+from tensorflow.python.data.kernel_tests import checkpoint_test_base
 from tensorflow.python.data.kernel_tests import test_base
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.eager import def_function
 from tensorflow.python.framework import combinations
-from tensorflow.python.platform import test
 
 
 class IOTest(test_base.DatasetTestBase, parameterized.TestCase):
@@ -39,9 +40,16 @@ class IOTest(test_base.DatasetTestBase, parameterized.TestCase):
     os.mkdir(tmpdir)
     self._test_dir = tmpdir
 
+    self._checkpoint_prefix = os.path.join(self.get_temp_dir(), "ckpt")
+    os.mkdir(self._checkpoint_prefix)
+    self._save_dir = os.path.join(self.get_temp_dir(), "save")
+    os.mkdir(self._save_dir)
+
   def tearDown(self):
     super(IOTest, self).tearDown()
     shutil.rmtree(self._test_dir)
+    shutil.rmtree(self._checkpoint_prefix)
+    shutil.rmtree(self._save_dir)
 
   @combinations.generate(
       combinations.times(test_base.eager_only_combinations(),
@@ -99,6 +107,42 @@ class IOTest(test_base.DatasetTestBase, parameterized.TestCase):
         self._test_dir, dataset.element_spec, compression=compression)
     self.assertDatasetProduces(dataset, range(42))
 
+  @combinations.generate(test_base.eager_only_combinations())
+  def testOptionalElementSpec(self):
+    range_dataset = dataset_ops.Dataset.range(42)
+    dict_dataset = dataset_ops.Dataset.from_tensor_slices({"a": [1, 2],
+                                                           "b": [3, 4]})
+    tuple_dataset = dataset_ops.Dataset.from_tensor_slices(([1, 2], [3, 4]))
+    dataset = dataset_ops.Dataset.zip((range_dataset, dict_dataset,
+                                       tuple_dataset))
+    io.save(dataset, self._test_dir)
+    dataset_loaded = io.load(self._test_dir)
+    self.assertDatasetsEqual(dataset, dataset_loaded)
 
-if __name__ == "__main__":
-  test.main()
+  @combinations.generate(test_base.eager_only_combinations())
+  def testRepeatAndPrefetch(self):
+    """This test reproduces github.com/tensorflow/tensorflow/issues/49165."""
+    dataset1 = dataset_ops.Dataset.from_tensor_slices(np.random.rand(16, 32))
+    io.save(dataset1, self._test_dir)
+    dataset = io.load(self._test_dir)
+    dataset = dataset.shuffle(buffer_size=16)
+    dataset = dataset.batch(16)
+    dataset = dataset.repeat()
+    dataset = dataset.prefetch(1)
+    next_element = self.getNext(dataset)
+    for _ in range(30):
+      self.evaluate(next_element())
+
+
+class LoadCheckpointTest(IOTest, checkpoint_test_base.CheckpointTestBase):
+
+  def _build_ds(self):
+    return io.load(self._save_dir)
+
+  @combinations.generate(
+      combinations.times(test_base.eager_only_combinations(),
+                         checkpoint_test_base.default_test_combinations()))
+  def test(self, verify_fn):
+    dataset = dataset_ops.Dataset.range(42)
+    io.save(dataset, self._save_dir)
+    verify_fn(self, self._build_ds, num_outputs=42)

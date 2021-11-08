@@ -582,6 +582,8 @@ OpLevelCostEstimator::OpLevelCostEstimator() {
   elementwise_ops_.emplace("Prod", EIGEN_COST(scalar_product_op<float>));
   elementwise_ops_.emplace("QuantizeAndDequantizeV2",
                            quantize_and_dequantize_v2_cost);
+  elementwise_ops_.emplace("QuantizeAndDequantizeV4",
+                           quantize_and_dequantize_v2_cost);
   elementwise_ops_.emplace("QuantizedSigmoid",
                            EIGEN_COST(scalar_logistic_op<float>));
   elementwise_ops_.emplace("QuantizeV2", quantize_v2_cost);
@@ -714,6 +716,8 @@ Status OpLevelCostEstimator::PredictNodeCosts(const OpContext& op_context,
   return PredictCostOfAnUnknownOp(op_context, node_costs);
 }
 
+// This method assumes a typical system composed of CPUs and GPUs, connected
+// through PCIe. To define device info more precisely, override this method.
 DeviceInfo OpLevelCostEstimator::GetDeviceInfo(
     const DeviceProperties& device) const {
   double gflops = -1;
@@ -732,35 +736,46 @@ DeviceInfo OpLevelCostEstimator::GetDeviceInfo(
       }
     }
   } else if (device.type() == "GPU") {
-    const std::string architecture = device.environment().at("architecture");
-    int cores_per_multiprocessor;
-    if (architecture < "3") {
-      // Fermi
-      cores_per_multiprocessor = 32;
-    } else if (architecture < "4") {
-      // Kepler
-      cores_per_multiprocessor = 192;
-    } else if (architecture < "6") {
-      // Maxwell
-      cores_per_multiprocessor = 128;
+    const auto& device_env = device.environment();
+    auto it = device_env.find("architecture");
+    if (it != device_env.end()) {
+      const std::string architecture = device_env.at("architecture");
+      int cores_per_multiprocessor;
+      if (architecture < "3") {
+        // Fermi
+        cores_per_multiprocessor = 32;
+      } else if (architecture < "4") {
+        // Kepler
+        cores_per_multiprocessor = 192;
+      } else if (architecture < "6") {
+        // Maxwell
+        cores_per_multiprocessor = 128;
+      } else {
+        // Pascal (compute capability version 6) and Volta (compute capability
+        // version 7)
+        cores_per_multiprocessor = 64;
+      }
+      gflops = device.num_cores() * device.frequency() * 1e-3 *
+               cores_per_multiprocessor * kOpsPerMac;
+      if (device.bandwidth() > 0) {
+        gb_per_sec = device.bandwidth() / 1e6;
+      } else {
+        gb_per_sec = 100;
+      }
     } else {
-      // Pascal (compute capability version 6) and Volta (compute capability
-      // version 7)
-      cores_per_multiprocessor = 64;
+      // Architecture is not available (ex: pluggable device), return default
+      // value.
+      gflops = 100;     // Dummy value;
+      gb_per_sec = 12;  // default PCIe x16 gen3.
     }
-    gflops = device.num_cores() * device.frequency() * 1e-3 *
-             cores_per_multiprocessor * kOpsPerMac;
-    if (device.bandwidth() > 0) {
-      gb_per_sec = device.bandwidth() / 1e6;
-    } else {
-      gb_per_sec = 100;
-    }
+  } else {
+    LOG_EVERY_N(WARNING, 1000) << "Unknown device type: " << device.type()
+                               << ", assuming PCIe between CPU and GPU.";
+    gflops = 1;  // Dummy value; data transfer ops would not have compute ops.
+    gb_per_sec = 12;  // default PCIe x16 gen3.
   }
   VLOG(1) << "Device: " << device.type() << " gflops: " << gflops
           << " gb_per_sec: " << gb_per_sec;
-
-  DCHECK_LT(0, gflops) << device.DebugString();
-  DCHECK_LT(0, gb_per_sec) << device.DebugString();
 
   return DeviceInfo(gflops, gb_per_sec);
 }

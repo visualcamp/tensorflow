@@ -25,6 +25,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/executor_factory.h"
 #include "tensorflow/core/common_runtime/graph_view.h"
 #include "tensorflow/core/common_runtime/immutable_executor_state.h"
+#include "tensorflow/core/common_runtime/metric_util.h"
 #include "tensorflow/core/common_runtime/pending_counts.h"
 #include "tensorflow/core/common_runtime/propagator_state.h"
 #include "tensorflow/core/common_runtime/renamed_device.h"
@@ -74,12 +75,6 @@ limitations under the License.
 
 namespace tensorflow {
 
-// Temporary flag for controlling whether to always track kernel execution
-// costs.
-static bool always_track_kernel_execution_cost = false;
-void EnableAlwaysTrackKernelExecutionCost() {
-  always_track_kernel_execution_cost = true;
-}
 namespace {
 
 // 1-D, 0 element tensor.
@@ -162,7 +157,7 @@ class ExecutorImpl : public Executor {
     KernelStats() = default;
 
     void Initialize(const GraphView& gview) {
-      is_expensive_ = absl::make_unique<std::atomic<bool>[]>(gview.num_nodes());
+      is_expensive_.resize(gview.num_nodes());
       cost_estimates_ =
           absl::make_unique<std::atomic_uint_fast64_t[]>(gview.num_nodes());
       for (int32 i = 0; i < gview.num_nodes(); ++i) {
@@ -183,23 +178,26 @@ class ExecutorImpl : public Executor {
               kOpIsExpensiveThresholdCycles);
     }
 
+    // Returns the value of kernel->IsExpensive().
+    bool HasExpensiveMarker(const NodeItem& node) const {
+      return is_expensive_[node.node_id];
+    }
+
     // Updates the dynamic cost estimate, which is used to determine whether the
     // given node is expensive. The new cost estimate is a weighted average of
-    // the old cost estimate and the latest cost.
+    // the old cost estimate and the latest cost. We only update cost estimates
+    // for kernels for which IsExpensive() return true.
     void UpdateCostEstimate(const NodeItem& node, uint64 elapsed_cycles) {
       // N.B. Updates to `cost_estimate` are atomic but unlocked.  Simultaneous
       // updates may result in one or more updates being ignored.  This does not
       // affect correctness but may slow down the update frequency.
       std::atomic_uint_fast64_t& cost_estimate = cost_estimates_[node.node_id];
-      uint64 new_estimate = (kCostDecay - 1) *
-                                cost_estimate.load(std::memory_order_relaxed) /
-                                kCostDecay +
-                            (elapsed_cycles / kCostDecay);
-      cost_estimate.store(new_estimate, std::memory_order_relaxed);
+      auto prev_estimate = cost_estimate.load(std::memory_order_relaxed);
 
-      bool new_is_expensive = (new_estimate >= kOpIsExpensiveThresholdCycles);
-      is_expensive_[node.node_id].store(new_is_expensive,
-                                        std::memory_order_relaxed);
+      uint64 new_estimate =
+          ((kCostDecay - 1) * prev_estimate + elapsed_cycles) / kCostDecay;
+
+      cost_estimate.store(new_estimate, std::memory_order_relaxed);
     }
 
    private:
@@ -207,10 +205,11 @@ class ExecutorImpl : public Executor {
     // determine whether an operation should be place in a threadpool.
     // Operations start out "expensive".
     static constexpr uint64 kInitialCostEstimateCycles = 100 * 1000 * 1000;
-    static constexpr uint64 kOpIsExpensiveThresholdCycles = 5000;
+    static constexpr uint64 kOpIsExpensiveThresholdCycles = 8000;
     static constexpr uint64 kCostDecay = 10;
 
-    std::unique_ptr<std::atomic<bool>[]> is_expensive_;
+    std::vector<bool> is_expensive_;
+    // std::unique_ptr<std::atomic<bool>[]> is_expensive_;
     std::unique_ptr<std::atomic_uint_fast64_t[]> cost_estimates_;
   };
 
@@ -346,6 +345,8 @@ class ExecutorState {
   const bool log_memory_;
 
   int64 step_id_;
+  int64 start_time_usecs_ = 0;
+
   // Not owned.
   RendezvousInterface* rendezvous_;
   CollectiveExecutor* collective_executor_ = nullptr;
@@ -396,6 +397,7 @@ ExecutorState<PropagatorStateType>::ExecutorState(
     : vlog_(VLOG_IS_ON(1)),
       log_memory_(LogMemory::IsEnabled()),
       step_id_(args.step_id),
+      start_time_usecs_(args.start_time_usecs),
       rendezvous_(args.rendezvous),
       collective_executor_(args.collective_executor),
       session_state_(args.session_state),
@@ -569,24 +571,19 @@ Status ExecutorState<PropagatorStateType>::ProcessSync(
         },
         profiler::GetTFTraceMeLevel(is_expensive));
     device->Compute(op_kernel, &ctx);
-  } else {
-    // In the common case, avoid creating any tracing objects.
-    if (is_expensive) {
-      KernelTimer timer;
-      device->Compute(op_kernel, &ctx);
+  } else if (kernel_stats_->HasExpensiveMarker(item)) {
+    KernelTimer timer;
+    device->Compute(op_kernel, &ctx);
+    // For expensive kernels, always update the cost estimate. For inexpensive
+    // kernels, update the cost estimate with ~1/16 probability. This assumes
+    // that the last 4 bits of the CPU cycle count is uniformly distributed.
+    constexpr int kKernelExecutionTrackingInvocationSkipCount = 16;
+    if (is_expensive ||
+        timer.start_cycles % kKernelExecutionTrackingInvocationSkipCount == 0) {
       kernel_stats_->UpdateCostEstimate(item, timer.ElapsedCycles());
-    } else if (always_track_kernel_execution_cost) {
-      KernelTimer timer;
-      device->Compute(op_kernel, &ctx);
-      // If always_track_kernel_execution_cost is set, update the cost estimate
-      // for inexpensive kernels with ~1/8 probability. This assumes that the
-      // last 3 bits of the CPU cycle count is uniformly distributed.
-      constexpr int kKernelExecutionTrackingInvocationSkipCount = 8;
-      if (timer.start_cycles % kKernelExecutionTrackingInvocationSkipCount == 0)
-        kernel_stats_->UpdateCostEstimate(item, timer.ElapsedCycles());
-    } else {
-      device->Compute(op_kernel, &ctx);
     }
+  } else {
+    device->Compute(op_kernel, &ctx);
   }
   nodestats::SetOpEnd(stats);
   if (outputs->size() < item.num_outputs) outputs->resize(item.num_outputs);
@@ -772,6 +769,11 @@ void ExecutorState<PropagatorStateType>::Process(TaggedNode tagged_node,
               << SummarizeNodeDef(item.kernel->def())
               << (tagged_node.get_is_dead() ? " is dead" : "")
               << " device: " << device->name();
+    }
+
+    const NodeDef& ndef = item.kernel->def();
+    if (TF_PREDICT_FALSE(ShouldLogLatencyMetrics(ndef))) {
+      LogLatencyMetrics(ndef, EnvTime::NowMicros(), start_time_usecs_);
     }
 
     Entry* first_input = propagator_.GetInputTensors(tagged_node);
@@ -995,8 +997,12 @@ Status ExecutorState<PropagatorStateType>::ProcessOutputs(
                 s.error_message(),
                 "\nHint: If you want to see a list of allocated tensors when "
                 "OOM happens, add report_tensor_allocations_upon_oom "
-                "to RunOptions for current allocation info.\n"));
+                "to RunOptions for current allocation info. This isn't "
+                "available when running in Eager mode.\n"));
       }
+    } else if (s.code() == error::UNAVAILABLE &&
+               !item.is_distributed_communication) {
+      s = errors::ReplaceErrorFromNonCommunicationOps(s, item.kernel->name());
     }
     return s;
   }

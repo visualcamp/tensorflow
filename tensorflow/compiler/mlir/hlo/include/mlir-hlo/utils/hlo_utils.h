@@ -71,7 +71,7 @@ DenseElementsAttr GetScalarOfType(Type ty, int64_t raw_value);
 // Enum type used to specify scalar argument to GetScalarLimitOfType.
 enum ScalarLimit {
   kLowest,          // The scalar corresponding to numeric_limits<T>::lowest.
-  kInfinityLowest,  // Like kMax, but returns -infinity where available.
+  kInfinityLowest,  // Like kLowest, but returns -infinity where available.
   kMax,             // The scalar corresponding to numeric_limits<T>::max.
   kInfinityMax,     // Like kMax, but returns infinity where available.
 };
@@ -87,6 +87,9 @@ DenseElementsAttr GetScalarLimitOfType(Type ty, ScalarLimit limit);
 // Returns empty string if no such op exists.
 std::string LmhloToMhloOpName(llvm::StringRef op_name,
                               mlir::MLIRContext* context);
+
+// Return true if Attr has values [0, 1, ...].
+bool IsSequenceStartingWith0(DenseIntElementsAttr attr);
 
 }  // namespace hlo
 }  // namespace mlir

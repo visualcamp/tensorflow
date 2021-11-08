@@ -25,15 +25,20 @@ import time
 from absl.testing import parameterized
 import numpy as np
 
+from google.protobuf import text_format
+
 from tensorflow.core.example import example_pb2
 from tensorflow.core.example import feature_pb2
+from tensorflow.core.framework import graph_pb2
 from tensorflow.python.client import session
 from tensorflow.python.eager import backprop
+from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
 from tensorflow.python.framework import composite_tensor
 from tensorflow.python.framework import config
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import importer
 from tensorflow.python.framework import indexed_slices
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
@@ -56,6 +61,7 @@ from tensorflow.python.ops import gradients as gradient_ops
 from tensorflow.python.ops import image_ops
 from tensorflow.python.ops import list_ops
 from tensorflow.python.ops import logging_ops
+from tensorflow.python.ops import manip_ops
 from tensorflow.python.ops import map_fn
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn
@@ -70,6 +76,7 @@ from tensorflow.python.ops import tensor_array_ops
 from tensorflow.python.ops import variables
 from tensorflow.python.ops.parallel_for import control_flow_ops as pfor_control_flow_ops
 from tensorflow.python.ops.parallel_for.test_util import PForTestCase
+from tensorflow.python.ops.ragged import ragged_tensor
 from tensorflow.python.ops.signal import fft_ops
 from tensorflow.python.platform import test
 from tensorflow.python.util import nest
@@ -146,6 +153,17 @@ class PForTest(PForTestCase):
         array_ops.ones((10, 5, 3)), shape=None)
     result = pfor_control_flow_ops.vectorized_map(compute, x)
     self.run_and_assert_equal(result, array_ops.ones((10, 1, 3)))
+
+  def test_where_shape(self):
+    @def_function.function
+    def f():
+      a = constant_op.constant([[1.], [1.]])
+      b = constant_op.constant([1.])
+      result = pfor_control_flow_ops.vectorized_map(
+          lambda x: array_ops.where(x > 0, x, b), a)
+      return result.shape
+
+    self.assertAllEqual([2, 1], f())
 
   def test_vectorized_map_broadcasts_unit_dimensions(self):
     convert_with_static_shape = ops.convert_to_tensor
@@ -314,6 +332,20 @@ class ReductionTest(PForTestCase):
                                 "parallel_iterations currently unsupported"):
       pfor_control_flow_ops.pfor(loop_fn, 8, parallel_iterations=2)
 
+  def test_var_loop_len(self):
+    if context.executing_eagerly():
+      self.skipTest("Variable length not possible under eager execution.")
+
+    x = random_ops.random_uniform([8, 3])
+
+    def loop_fn(i, pfor_config):
+      return pfor_config.reduce_sum(array_ops.gather(x, i))
+
+    num_iters = array_ops.placeholder(dtypes.int32)
+    pfor = pfor_control_flow_ops.pfor(loop_fn, num_iters)
+    with self.cached_session() as sess:
+      sess.run(pfor, feed_dict={num_iters: 8})
+
 
 @test_util.run_all_in_graph_and_eager_modes
 class BitwiseTest(PForTestCase):
@@ -438,6 +470,117 @@ class NNTest(PForTestCase):
               padding="VALID",
               data_format="NHWC") for inp in [x_i, x_0]
       ]
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_depthwise_conv2d_native(self):
+    x = random_ops.random_uniform([3, 2, 12, 12, 3])
+    filt = random_ops.random_uniform([3, 3, 3, 3, 2])
+
+    def loop_fn(i):
+      x1 = array_ops.gather(x, i)
+      filt1 = array_ops.gather(filt, i)
+      return nn.depthwise_conv2d_native(
+          x1, filt1, strides=[1, 2, 2, 1], padding="VALID", data_format="NHWC")
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_depthwise_conv2d_native_backprop_input(self):
+    x_shape = [2, 12, 12, 3]
+    filt = random_ops.random_uniform([3, 3, 3, 3, 2])
+    grad = random_ops.random_uniform([3, 2, 5, 5, 6])
+
+    def loop_fn(i):
+      grad1 = array_ops.gather(grad, i)
+      filt1 = array_ops.gather(filt, i)
+      return nn.depthwise_conv2d_native_backprop_input(
+          x_shape,
+          filt1,
+          grad1,
+          strides=[1, 2, 2, 1],
+          padding="VALID",
+          data_format="NHWC")
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_depthwise_conv2d_native_backprop_filter(self):
+    x = random_ops.random_uniform([3, 2, 12, 12, 3])
+    filter_sizes = [3, 3, 3, 2]
+    grad = random_ops.random_uniform([3, 2, 5, 5, 6])
+
+    def loop_fn(i):
+      x_i = array_ops.gather(x, i)
+      grad_i = array_ops.gather(grad, i)
+      return nn.depthwise_conv2d_native_backprop_filter(
+          x_i,
+          filter_sizes,
+          grad_i,
+          strides=[1, 2, 2, 1],
+          padding="VALID",
+          data_format="NHWC")
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_depthwise_conv2d_native_nchw(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("NCHW only works on GPU")
+    x = random_ops.random_uniform([3, 2, 3, 12, 12])
+    filt = random_ops.random_uniform([3, 3, 3, 3, 2])
+
+    def loop_fn(i):
+      x1 = array_ops.gather(x, i)
+      filt1 = array_ops.gather(filt, i)
+      return nn.depthwise_conv2d_native(
+          x1, filt1, strides=[1, 1, 2, 2], padding="VALID", data_format="NCHW")
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_depthwise_conv2d_native_backprop_input_nchw(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("NCHW only works on GPU")
+    x_shape = [2, 3, 12, 12]
+    filt = random_ops.random_uniform([3, 3, 3, 3, 2])
+    grad = random_ops.random_uniform([3, 2, 6, 5, 5])
+
+    def loop_fn(i):
+      grad1 = array_ops.gather(grad, i)
+      filt1 = array_ops.gather(filt, i)
+      return nn.depthwise_conv2d_native_backprop_input(
+          x_shape,
+          filt1,
+          grad1,
+          strides=[1, 1, 2, 2],
+          padding="VALID",
+          data_format="NCHW")
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_depthwise_conv2d_native_backprop_filter_nchw(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("NCHW only works on GPU")
+    x = random_ops.random_uniform([3, 2, 3, 12, 12])
+    filter_sizes = [3, 3, 3, 2]
+    grad = random_ops.random_uniform([3, 2, 6, 5, 5])
+
+    def loop_fn(i):
+      x_i = array_ops.gather(x, i)
+      grad_i = array_ops.gather(grad, i)
+      return nn.depthwise_conv2d_native_backprop_filter(
+          x_i,
+          filter_sizes,
+          grad_i,
+          strides=[1, 1, 2, 2],
+          padding="VALID",
+          data_format="NCHW")
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_roll(self):
+    x = random_ops.random_uniform([3, 6, 7])
+
+    def loop_fn(i):
+      x_i = array_ops.gather(x, i)
+      return manip_ops.roll(x_i, 3, axis=1)
 
     self._test_loop_fn(loop_fn, 3)
 
@@ -776,7 +919,6 @@ class StatelessRandomTest(PForTestCase):
 
 class LoggingTest(PForTestCase):
 
-  @test_util.run_v1_only("b/122612051")
   def test_print(self):
     x = random_ops.random_uniform([3, 5])
 
@@ -784,6 +926,18 @@ class LoggingTest(PForTestCase):
       x1 = array_ops.gather(x, i)
       return logging_ops.Print(
           x1, [x1, "x1", array_ops.shape(x1)], summarize=10)
+
+    self._test_loop_fn(loop_fn, 3)
+
+  def test_print_v2(self):
+    x = random_ops.random_uniform([3, 5])
+
+    def loop_fn(i):
+      x1 = array_ops.gather(x, i)
+      with ops.control_dependencies([
+          logging_ops.print_v2(
+              x1, [x1, "x1", array_ops.shape(x1)], summarize=10)]):
+        return x1
 
     self._test_loop_fn(loop_fn, 3)
 
@@ -795,6 +949,8 @@ class LoggingTest(PForTestCase):
     # TODO(agarwal): make this work with for_loop.
     with session.Session() as sess:
       sess.run(pfor_control_flow_ops.pfor(loop_fn, 3))
+      sess.run(pfor_control_flow_ops.pfor(
+          lambda i, pfor_config: loop_fn(i), 3))
 
 
 class TensorArrayTest(PForTestCase):
@@ -942,6 +1098,46 @@ class TensorListTest(PForTestCase):
 
     self._test_loop_fn(loop_fn, 3)
 
+  def _make_graph_def(self, text):
+    ret = graph_pb2.GraphDef()
+    text_format.Parse(text, ret)
+    return ret
+
+  def test_no_fallback_with_internal_stacking(self):
+
+    # Create an op (really a function) that pfor definitely does not have a
+    # converter for. Assumes pfor does not start looking up function definitions
+    # for op-type-is-function-name calls.
+    @def_function.function
+    def opaque_list_fetch(x):
+      array_ops.identity(x)
+      return list_ops.tensor_list_get_item(x, 0, dtypes.int32)
+
+    external_handle = list_ops.tensor_list_reserve([], 2, dtypes.int32)
+    opaque_list_fetch_concrete = opaque_list_fetch.get_concrete_function(
+        external_handle)
+    opaque_list_fetch_name = opaque_list_fetch_concrete.name
+
+    def loop_fn(i):
+      h1 = list_ops.tensor_list_reserve([], 2, dtypes.int32)
+      h1 = list_ops.tensor_list_set_item(h1, 0, i)
+      opaque_list_fetch_concrete.add_to_graph()
+      graph_def = self._make_graph_def("""
+         node { name: 'x' op: 'Placeholder'
+                attr { key: 'dtype' value { type: DT_FLOAT } }}
+         node { name: 'fn' op: '""" + opaque_list_fetch_name.decode()
+                                       + """' input: 'x:0' }""")
+      return importer.import_graph_def(
+          graph_def,
+          input_map={"x:0": h1},
+          return_elements=["fn"],
+          name="import")[0].outputs[0]
+
+    with self.assertRaisesRegex(ValueError, "No pfor vectorization"):
+      self._test_loop_fn(loop_fn, 3, fallback_to_while_loop=False)
+    with self.assertRaisesRegex(ValueError, "No pfor vectorization"):
+      self._test_loop_fn(loop_fn, 3, fallback_to_while_loop=True)
+
   def test_create_inside_and_write(self):
 
     def loop_fn(i):
@@ -1062,6 +1258,32 @@ class TensorListTest(PForTestCase):
       return list_ops.tensor_list_stack(handle, dtypes.int32)
 
     self._test_loop_fn(loop_fn, 3)
+
+  def test_loop_variant_scatter_indices(self):
+
+    def loop_fn(i):
+      handle = list_ops.tensor_list_reserve([2], 10, dtypes.int32)
+      handle = list_ops.tensor_list_scatter(
+          [[1, i], [i + 1, 2]],
+          [i, i + 5], input_handle=handle)
+      return list_ops.tensor_list_stack(handle, dtypes.int32)
+
+    self._test_loop_fn(loop_fn, 5)
+
+  def test_loop_variant_scatter_duplicate_indices(self):
+    if test_util.is_gpu_available():
+      self.skipTest(
+          "Flaky in some GPU configurations due to TensorScatterNdUpdate "
+          "nondeterminism.")
+
+    def loop_fn(i):
+      handle = list_ops.tensor_list_reserve([2], 10, dtypes.int32)
+      handle = list_ops.tensor_list_scatter(
+          [[1, i], [1, i + 1], [i + 2, 3]],
+          [i, i, i + 2], input_handle=handle)
+      return list_ops.tensor_list_stack(handle, dtypes.int32)
+
+    self._test_loop_fn(loop_fn, 5)
 
   def test_create_outside_and_gather(self):
     handle = list_ops.tensor_list_reserve([2], 2, dtypes.int32)
@@ -1671,6 +1893,20 @@ class WhileV2Test(PForTestCase):
         v_log_prob, (x,), delta=1e-3)
     self.assertAllClose(theoretical, numerical, rtol=1e-2)
 
+  def test_scan_captured_variable(self):
+    if not context.executing_eagerly():
+      self.skipTest("Test only written for 2.x")
+    v = variables.Variable(math_ops.range(10, dtype=dtypes.float32))
+
+    def loop_fn(idx):
+      del idx
+      return functional_ops.scan_v2(lambda _, i: array_ops.gather(v, i),
+                                    elems=math_ops.range(v.shape[0]),
+                                    initializer=0.0)
+    with backprop.GradientTape() as tape:
+      result = pfor_control_flow_ops.pfor(loop_fn, 2)
+    self.assertAllClose([2.] * 10, tape.gradient(result, v))
+
 
 @test_util.run_all_in_graph_and_eager_modes
 class NestedControlFlowTest(PForTestCase):
@@ -2157,6 +2393,27 @@ class CompositeTensorTest(PForTestCase, parameterized.TestCase):
     self.assertTrue(particles.mass.shape, [4, 1, 3])
     self.assertAllEqual(particles.velocity.shape, [4, 5, 3])
 
+  def test_vectorized_map_gathers_composite_tensors(self):
+    particles = Particle(mass=[1., 2., 3., 4., 5.],
+                         velocity=[1., 2., 3., 4., 5.])
+    self.assertAllEqual(
+        pfor_control_flow_ops.vectorized_map(
+            lambda x: x.mass * x.velocity, particles),
+        particles.mass * particles.velocity)
+
+  def test_vectorized_map_of_ragged_tensors(self):
+    # Vmap should be able to handle ragged Tensors as long as they're not
+    # *actually* ragged.
+    ragged = ragged_tensor.RaggedTensor.from_uniform_row_length(
+        ragged_tensor.RaggedTensor.from_row_lengths(
+            values=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            row_lengths=[3, 3, 3, 3]),
+        uniform_row_length=2)  # Overall shape [2, 2, 3].
+    self.assertAllEqual(
+        pfor_control_flow_ops.vectorized_map(
+            lambda x: x.to_tensor(shape=[2, 3]), ragged),
+        ragged.to_tensor(shape=[2, 2, 3]))
+
 
 class ParsingTest(PForTestCase):
 
@@ -2320,6 +2577,9 @@ class SpectralTest(PForTestCase, parameterized.TestCase):
       (fft_ops.rfft2d,),
       (fft_ops.rfft3d,),
   )
+  @test.disable_with_predicate(
+      pred=test.is_built_with_rocm,
+      skip_message="Disable subtest on ROCm due to rocfft issues")
   def test_rfft(self, op_func):
     for dtype in (dtypes.float32, dtypes.float64):
       x = random_ops.random_uniform([2, 3, 4, 3, 4], dtype=dtype)
@@ -2338,6 +2598,9 @@ class SpectralTest(PForTestCase, parameterized.TestCase):
       (fft_ops.irfft2d,),
       (fft_ops.irfft3d,),
   )
+  @test.disable_with_predicate(
+      pred=test.is_built_with_rocm,
+      skip_message="Disable subtest on ROCm due to rocfft issues")
   def test_irfft(self, op_func):
     if config.list_physical_devices("GPU"):
       # TODO(b/149957923): The test is flaky

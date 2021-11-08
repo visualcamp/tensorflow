@@ -39,11 +39,11 @@ const float kBlockOverRandomSparsityRatio = 0.9;
 
 Eigen::half APFloatToEigenHalf(const APFloat& val) {
   uint16_t raw_data = val.bitcastToAPInt().getZExtValue();
-  return Eigen::half_impl::raw_uint16_to_half(raw_data);
+  return Eigen::numext::bit_cast<Eigen::half>(raw_data);
 }
 
 APFloat EigenHalfToAPFloat(const Eigen::half& val) {
-  uint16_t raw_data = val.x;
+  uint16_t raw_data = Eigen::numext::bit_cast<uint16_t>(val);
   return APFloat(APFloat::IEEEhalf(), APInt(16, raw_data));
 }
 
@@ -386,7 +386,7 @@ void DenseToSparse::runOnFunction() {
       } else if (auto cst = dyn_cast<QConstOp>(inst)) {
         auto attr = cst.value();
         auto type = cst.getType().cast<ShapedType>();
-        std::vector<int8_t> dense_data(type.getNumElements());
+        std::vector<int8_t> dense_data;
         dense_data.reserve(type.getNumElements());
         for (const auto& val : attr.getValues<int8_t>())
           dense_data.push_back(val);

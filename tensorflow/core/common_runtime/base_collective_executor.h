@@ -97,20 +97,19 @@ class BaseCollectiveExecutor : public CollectiveExecutor {
  public:
   BaseCollectiveExecutor(CollectiveExecutorMgrInterface* cem,
                          CollectiveRemoteAccess* remote_access, int64 step_id,
-                         const DeviceMgr* dev_mgr, const string* gpu_ring_order,
+                         const DeviceMgr* dev_mgr,
                          std::shared_ptr<UnboundedWorkQueue> work_queue)
       : CollectiveExecutor(cem),
         step_id_(step_id),
         dev_mgr_(dev_mgr),
         remote_access_(remote_access),
-        gpu_ring_order_(gpu_ring_order),
         work_queue_(std::move(work_queue)) {}
 
   ~BaseCollectiveExecutor() override;
 
   void StartAbort(const Status& s) override TF_LOCKS_EXCLUDED(status_mu_);
 
-  void ExecuteAsync(OpKernelContext* ctx, const CollectiveParams& col_params,
+  void ExecuteAsync(OpKernelContext* ctx, const CollectiveParams* col_params,
                     const string& exec_key, StatusCallback done) override;
 
   void CompleteParamsAsync(const DeviceAttributes& device, CollectiveParams* cp,
@@ -139,7 +138,6 @@ class BaseCollectiveExecutor : public CollectiveExecutor {
   const int64 step_id_;
   const DeviceMgr* dev_mgr_;  // Not owned.
   std::unique_ptr<CollectiveRemoteAccess> remote_access_;
-  const string* gpu_ring_order_;  // Not owned.
   // Ownership of `work_queue_` is shared between `this` and
   // `CollectiveExecutorMgr`.
   std::shared_ptr<UnboundedWorkQueue> work_queue_;

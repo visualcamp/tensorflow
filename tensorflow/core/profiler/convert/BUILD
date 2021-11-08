@@ -4,7 +4,7 @@ load("//tensorflow/core/profiler/builds:build_config.bzl", "tf_profiler_copts")
 
 package(
     default_visibility = ["//tensorflow/core/profiler:internal"],
-    licenses = ["notice"],  # Apache 2.0
+    licenses = ["notice"],
 )
 
 cc_library(
@@ -703,6 +703,7 @@ cc_library(
         "//tensorflow/core/profiler/utils:xplane_schema",
         "//tensorflow/core/profiler/utils:xplane_utils",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
     ],
 )
 

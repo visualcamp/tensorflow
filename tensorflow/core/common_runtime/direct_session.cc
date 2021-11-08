@@ -73,7 +73,7 @@ limitations under the License.
 #include "tensorflow/core/platform/tracing.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/profiler/lib/connected_traceme.h"
-#include "tensorflow/core/profiler/lib/profiler_session.h"
+#include "tensorflow/core/profiler/lib/device_profiler_session.h"
 #include "tensorflow/core/profiler/lib/traceme_encode.h"
 #include "tensorflow/core/protobuf/config.pb.h"
 #include "tensorflow/core/util/device_name_utils.h"
@@ -497,11 +497,6 @@ Status DirectSession::RunInternal(
     CallFrameInterface* call_frame, ExecutorsAndKeys* executors_and_keys,
     RunMetadata* run_metadata,
     const thread::ThreadPoolOptions& threadpool_options) {
-  // This is a temporary flag for controlling whether to always track the kernel
-  // execution cost. We will remove this once the feature is validated.
-  if (run_options.experimental().always_track_kernel_execution_cost())
-    EnableAlwaysTrackKernelExecutionCost();
-
   const uint64 start_time_usecs = options_.env->NowMicros();
   const int64 executor_step_count = executors_and_keys->step_count.fetch_add(1);
   RunState run_state(step_id, &devices_);
@@ -553,15 +548,8 @@ Status DirectSession::RunInternal(
       }
     }
     if (!collective_executor_mgr_) {
-      std::unique_ptr<DeviceResolverInterface> drl(
-          new DeviceResolverLocal(device_mgr_.get()));
-      std::unique_ptr<ParamResolverInterface> cprl(
-          new CollectiveParamResolverLocal(options_.config, device_mgr_.get(),
-                                           drl.get(),
-                                           "/job:localhost/replica:0/task:0"));
-      collective_executor_mgr_.reset(new CollectiveExecutorMgr(
-          options_.config, device_mgr_.get(), std::move(drl), std::move(cprl),
-          MaybeCreateNcclCommunicator()));
+      collective_executor_mgr_ = CreateProdLocalCollectiveExecutorMgr(
+          options_.config, device_mgr_.get(), MaybeCreateNcclCommunicator());
     }
     run_state.collective_executor.reset(new CollectiveExecutor::Handle(
         collective_executor_mgr_->FindOrCreate(step_id), true /*inherit_ref*/));
@@ -656,6 +644,7 @@ Status DirectSession::RunInternal(
   args.sync_on_finish = sync_on_finish_;
   args.user_intra_op_threadpool = threadpool_options.intra_op_threadpool;
   args.run_all_kernels_inline = pool == nullptr;
+  args.start_time_usecs = start_time_usecs;
 
   const bool do_trace = (run_options.trace_level() > RunOptions::NO_TRACE);
 
@@ -678,11 +667,9 @@ Status DirectSession::RunInternal(
     args.stats_collector = run_state.collector.get();
   }
 
-  std::unique_ptr<ProfilerSession> profiler_session;
+  std::unique_ptr<DeviceProfilerSession> device_profiler_session;
   if (run_options.trace_level() >= RunOptions::HARDWARE_TRACE) {
-    ProfileOptions options = ProfilerSession::DefaultOptions();
-    options.set_host_tracer_level(0);
-    profiler_session = ProfilerSession::Create(options);
+    device_profiler_session = DeviceProfilerSession::Create();
   }
 
   // Register this step with session's cancellation manager, so that
@@ -760,8 +747,9 @@ Status DirectSession::RunInternal(
     run_status.Update(errors::Cancelled("Run call was cancelled"));
   }
 
-  if (profiler_session) {
-    TF_RETURN_IF_ERROR(profiler_session->CollectData(run_metadata));
+  if (device_profiler_session) {
+    TF_RETURN_IF_ERROR(device_profiler_session->CollectData(
+        run_metadata->mutable_step_stats()));
   }
 
   TF_RETURN_IF_ERROR(run_status);
@@ -1671,7 +1659,7 @@ Status DirectSession::CreateGraphs(
     // Just return '1'.
     return 1;
   };
-  popts.flib_def = &client_graph->graph.flib_def();
+  popts.flib_def = flib_def->get();
   popts.control_flow_added = false;
 
   std::unordered_map<string, GraphDef> partitions;

@@ -157,12 +157,27 @@ class Tensor {
   /// Acquires a ref on buf that belongs to this Tensor.
   Tensor(DataType type, const TensorShape& shape, TensorBuffer* buf);
 
+  /// \brief Creates a tensor with the input datatype, shape and buf.
+  ///
+  /// Takes an ownership of the bufffer from the reference counted pointer.
+  Tensor(DataType type, const TensorShape& shape,
+         core::RefCountPtr<TensorBuffer> buf);
+
   /// \brief Creates an empty Tensor of the given data type.
   ///
   /// Like Tensor(), returns a 1-dimensional, 0-element Tensor with
   /// IsInitialized() returning True. See the Tensor() documentation
   /// for details.
   explicit Tensor(DataType type);
+
+  /// \brief Initializes a tensor with the input `type` and `shape`, or returns
+  /// an error and leaves `out_tensor` unmodified. This factory method should be
+  /// used instead of the corresponding constructor if calling code cannot
+  /// validate that the `DataType` is valid and supported.
+  ///
+  /// The underlying buffer is allocated using a `CPUAllocator`.
+  static Status BuildTensor(DataType type, const TensorShape& shape,
+                            Tensor* out_tensor);
 
  private:
   // A tag type for selecting the `Tensor` constructor overload that creates a

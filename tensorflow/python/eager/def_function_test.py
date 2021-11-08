@@ -28,6 +28,7 @@ from absl.testing import parameterized
 from six.moves import range
 
 from tensorflow.python.autograph.core import converter
+from tensorflow.python.eager import backprop
 from tensorflow.python.eager import def_function
 from tensorflow.python.eager import lift_to_graph
 from tensorflow.python.framework import constant_op
@@ -38,6 +39,7 @@ from tensorflow.python.framework import tensor_spec
 from tensorflow.python.framework import test_util
 from tensorflow.python.module import module
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import cond_v2
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import random_ops
@@ -239,6 +241,69 @@ class DefFunctionTest(test.TestCase, parameterized.TestCase):
 
     m1 = MyModel()
     self.assertAllEqual(m1.apply(3.0), 6.0)
+
+  def testMethodAllowDynamicVariable(self):
+
+    class Foo:
+
+      def __init__(self):
+        self._flag_keyed_vars = {}
+        self.trace_count = 0
+
+      def __call__(self, var_creation_flag):
+        self.compute(var_creation_flag)
+        return self._flag_keyed_vars[var_creation_flag]
+
+      @def_function.function
+      def compute(self, var_creation_flag):
+        self.trace_count += 1
+        if var_creation_flag not in self._flag_keyed_vars:
+          if var_creation_flag:
+            self._flag_keyed_vars[var_creation_flag] = variables.Variable(1.0)
+          else:
+            self._flag_keyed_vars[var_creation_flag] = variables.Variable(2.0)
+
+    def_function.ALLOW_DYNAMIC_VARIABLE_CREATION = True
+    foo = Foo()
+    self.assertAllEqual(foo(True), 1.0)
+    self.assertEqual(foo.trace_count, 2)
+    self.assertAllEqual(foo(True), 1.0)
+    self.assertEqual(foo.trace_count, 2)
+    self.assertAllEqual(foo(False), 2.0)
+    self.assertEqual(foo.trace_count, 3)
+
+  def testMethodNotAllowDynamicVariable(self):
+
+    class Foo:
+
+      def __init__(self):
+        self._flag_keyed_vars = {}
+        self.trace_count = 0
+
+      def __call__(self, var_creation_flag):
+        self.compute(var_creation_flag)
+        return self._flag_keyed_vars[var_creation_flag]
+
+      @def_function.function
+      def compute(self, var_creation_flag):
+        self.trace_count += 1
+        if var_creation_flag not in self._flag_keyed_vars:
+          if var_creation_flag:
+            self._flag_keyed_vars[var_creation_flag] = variables.Variable(1.0)
+          else:
+            self._flag_keyed_vars[var_creation_flag] = variables.Variable(2.0)
+
+    def_function.ALLOW_DYNAMIC_VARIABLE_CREATION = False
+    foo = Foo()
+    self.assertAllEqual(foo(True), 1.0)
+    self.assertEqual(foo.trace_count, 2)
+    self.assertAllEqual(foo(True), 1.0)
+    self.assertEqual(foo.trace_count, 2)
+    msg = ('tf.function-decorated function tried to ' +
+           'create variables on non-first call.')
+    with self.assertRaisesRegex(ValueError, msg):
+      self.assertAllEqual(foo(False), 2.0)
+      self.assertEqual(foo.trace_count, 3)
 
   def test_functools_partial(self):
     self.assertAllClose(
@@ -1000,37 +1065,116 @@ class DefFunctionTest(test.TestCase, parameterized.TestCase):
     self.assertAllEqual(obj2.testDouble.experimental_get_tracing_count(), 3)
     self.assertAllEqual(obj1.testDouble.experimental_get_tracing_count(), 2)
 
-  def test_experimental_get_tracing_count_function(self):
+  def test_recursive_tf_function(self):
 
     @def_function.function
-    def double(a):
-      return a + a
+    def recursive_fn(n):
+      if n > 0:
+        return recursive_fn(n - 1)
+      return 1
 
-    double(constant_op.constant(1))
-    double(constant_op.constant(2))
-    self.assertAllEqual(double.experimental_get_tracing_count(), 1)
-    double(constant_op.constant('a'))
-    self.assertAllEqual(double.experimental_get_tracing_count(), 2)
+    self.assertEqual(recursive_fn(5).numpy(), 1)
 
-  def test_experimental_get_tracing_count_method(self):
+  def test_recursive_tf_function_with_gradients(self):
 
-    class TestClass():
+    @def_function.function
+    def recursive_fn(n, x):
+      if n > 0:
+        return n * recursive_fn(n - 1, x)
+      else:
+        return x
 
-      @def_function.function
-      def testDouble(self, a):
-        return a + a
+    x = variables.Variable(1.0)
+    with backprop.GradientTape() as tape:
+      g = recursive_fn(5, x)
 
-    obj1 = TestClass()
-    obj1.testDouble(constant_op.constant(1))
-    obj1.testDouble(constant_op.constant(2))
-    obj1.testDouble(constant_op.constant(1.1))
-    self.assertAllEqual(obj1.testDouble.experimental_get_tracing_count(), 2)
-    obj2 = TestClass()
-    obj2.testDouble(constant_op.constant(1))
-    obj2.testDouble(constant_op.constant(1.1))
-    obj2.testDouble(constant_op.constant('a'))
-    self.assertAllEqual(obj2.testDouble.experimental_get_tracing_count(), 3)
-    self.assertAllEqual(obj1.testDouble.experimental_get_tracing_count(), 2)
+    dg_dx = tape.gradient(g, x)
+    self.assertEqual(dg_dx.numpy(), 120)
+
+  def test_recursive_python_function(self):
+
+    def recursive_py_fn(n):
+      if n > 0:
+        return recursive_py_fn(n - 1)
+      return 1
+
+    @def_function.function
+    def recursive_fn(n):
+      return recursive_py_fn(n)
+
+    self.assertEqual(recursive_fn(5).numpy(), 1)
+
+  def test_recursive_python_function_with_gradients(self):
+
+    def recursive_py_fn(n, x):
+      if n > 0:
+        return n * recursive_py_fn(n - 1, x)
+      return x
+
+    @def_function.function
+    def recursive_fn(n, x):
+      return recursive_py_fn(n, x)
+
+    x = variables.Variable(1.0)
+    with backprop.GradientTape() as tape:
+      g = recursive_fn(5, x)
+
+    dg_dx = tape.gradient(g, x)
+    self.assertEqual(dg_dx.numpy(), 120)
+
+  def test_recursive_tf_function_call_each_other(self):
+
+    @def_function.function
+    def recursive_fn1(n):
+      if n <= 1:
+        return 1
+      return recursive_fn2(n - 1)
+
+    @def_function.function
+    def recursive_fn2(n):
+      if n <= 1:
+        return 2
+      return recursive_fn1(n - 1)
+
+    self.assertEqual(recursive_fn1(5).numpy(), 1)
+    self.assertEqual(recursive_fn1(6).numpy(), 2)
+    self.assertEqual(recursive_fn2(5).numpy(), 2)
+    self.assertEqual(recursive_fn2(6).numpy(), 1)
+
+  def test_recursive_tf_function_call_each_other_with_gradients(self):
+
+    @def_function.function
+    def recursive_fn1(n, x):
+      if n <= 1:
+        return x
+      return n * recursive_fn2(n - 1, x)
+
+    @def_function.function
+    def recursive_fn2(n, x):
+      if n <= 1:
+        return 2 * x
+      return n * recursive_fn1(n - 1, x)
+
+    x = variables.Variable(1.0)
+    with backprop.GradientTape() as tape:
+      g1 = recursive_fn1(5, x)
+
+    dg1_dx = tape.gradient(g1, x)
+    self.assertEqual(dg1_dx.numpy(), 120)
+
+    with backprop.GradientTape() as tape:
+      g2 = recursive_fn2(5, x)
+
+    dg2_dx = tape.gradient(g2, x)
+    self.assertEqual(dg2_dx.numpy(), 240)
+
+  def test_recursive_tf_function_with_cond(self):
+    @def_function.function(autograph=False)
+    def recursive_fn(n):
+      return cond_v2.cond_v2(n > 0, recursive_fn(n - 1), 1)
+
+    with self.assertRaises(RecursionError):
+      recursive_fn(constant_op.constant(5))
 
 
 if __name__ == '__main__':

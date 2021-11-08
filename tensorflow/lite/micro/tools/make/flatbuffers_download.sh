@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2019 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2021 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,12 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR=${SCRIPT_DIR}/../../../../..
+cd "${ROOT_DIR}"
+
+source tensorflow/lite/micro/tools/make/bash_helpers.sh
+
 DOWNLOADS_DIR=${1}
 if [ ! -d ${DOWNLOADS_DIR} ]; then
   echo "The top-level downloads directory: ${DOWNLOADS_DIR} does not exist."
@@ -45,7 +51,7 @@ fi
 #   $1 - full path to the downloaded flexbuffers.h that will be patched in-place.
 function patch_to_avoid_strtod() {
   local input_flexbuffers_path="$1"
-  local temp_flexbuffers_path="/tmp/flexbuffers_patched.h"
+  local temp_flexbuffers_path="$(mktemp)"
   local string_to_num_line=`awk '/StringToNumber/{ print NR; }' ${input_flexbuffers_path}`
   local case_string_line=$((${string_to_num_line} - 2))
 
@@ -76,6 +82,7 @@ function patch_to_avoid_strtod() {
 #   $1 - path to the downloaded flatbuffers code.
 function delete_build_files() {
   rm -f `find ${1} -name BUILD`
+  rm -f `find ${1} -name BUILD.bazel`
 }
 
 DOWNLOADED_FLATBUFFERS_PATH=${DOWNLOADS_DIR}/flatbuffers
@@ -84,24 +91,20 @@ if [ -d ${DOWNLOADED_FLATBUFFERS_PATH} ]; then
   echo >&2 "${DOWNLOADED_FLATBUFFERS_PATH} already exists, skipping the download."
 else
   ZIP_PREFIX="dca12522a9f9e37f126ab925fd385c807ab4f84e"
-  FLATBUFFERS_URL="http://mirror.tensorflow.org/github.com/google/flatbuffers/archive/${ZIP_PREFIX}.zip"
+  FLATBUFFERS_URL="https://github.com/google/flatbuffers/archive/${ZIP_PREFIX}.zip"
   FLATBUFFERS_MD5="aa9adc93eb9b33fa1a2a90969e48baee"
 
-  wget ${FLATBUFFERS_URL} -O /tmp/${ZIP_PREFIX}.zip >&2
-  MD5=`md5sum /tmp/${ZIP_PREFIX}.zip | awk '{print $1}'`
+  TEMPDIR="$(mktemp -d)"
+  TEMPFILE="${TEMPDIR}/${ZIP_PREFIX}.zip"
+  wget ${FLATBUFFERS_URL} -O "$TEMPFILE" >&2
+  check_md5 "${TEMPFILE}" ${FLATBUFFERS_MD5}
 
-  if [[ ${MD5} != ${FLATBUFFERS_MD5} ]]
-  then
-    echo "Bad checksum. Expected: ${FLATBUFFERS_MD5}, Got: ${MD5}"
-    exit 1
-  fi
-
-  unzip -qo /tmp/${ZIP_PREFIX}.zip -d /tmp >&2
-  mv /tmp/flatbuffers-${ZIP_PREFIX} ${DOWNLOADED_FLATBUFFERS_PATH}
+  unzip -qo "$TEMPFILE" -d "${TEMPDIR}" >&2
+  mv "${TEMPDIR}/flatbuffers-${ZIP_PREFIX}" ${DOWNLOADED_FLATBUFFERS_PATH}
+  rm -rf "${TEMPDIR}"
 
   patch_to_avoid_strtod ${DOWNLOADED_FLATBUFFERS_PATH}/include/flatbuffers/flexbuffers.h
   delete_build_files ${DOWNLOADED_FLATBUFFERS_PATH}
-
 fi
 
 echo "SUCCESS"

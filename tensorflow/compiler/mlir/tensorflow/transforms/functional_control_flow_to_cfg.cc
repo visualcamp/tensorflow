@@ -17,6 +17,7 @@ limitations under the License.
 // TensorFlow dialect to MLIR Control Flow Graph (CFG) form.
 
 #include "mlir/Dialect/StandardOps/IR/Ops.h"  // from @llvm-project
+#include "mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
 #include "mlir/IR/Attributes.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
 #include "mlir/IR/Operation.h"  // from @llvm-project
@@ -35,6 +36,10 @@ namespace {
 
 struct FunctionalControlFlowToCFG
     : public PassWrapper<FunctionalControlFlowToCFG, FunctionPass> {
+  void getDependentDialects(mlir::DialectRegistry& registry) const override {
+    registry.insert<tensor::TensorDialect>();
+  }
+
   void runOnFunction() override;
 };
 
@@ -42,7 +47,7 @@ struct FunctionalControlFlowToCFG
 // control flow op into an i1 value.
 static Value LowerCondition(Location loc, Value value, OpBuilder* builder) {
   auto zero_d = builder->create<ToBoolOp>(loc, value);
-  auto scalar = builder->create<ExtractElementOp>(loc, zero_d);
+  auto scalar = builder->create<tensor::ExtractOp>(loc, zero_d);
   return scalar.getResult();
 }
 

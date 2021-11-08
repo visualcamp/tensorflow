@@ -30,7 +30,7 @@ namespace tensorflow {
 namespace {
 const char* kDeviceNamePrefix = "/job:localhost/replica:0/task:0";
 
-int64 GetTotalGPUMemory(PlatformGpuId gpu_id) {
+int64 GetTotalGPUMemory(PlatformDeviceId gpu_id) {
   se::StreamExecutor* se =
       DeviceIdUtil::ExecutorForPlatformDeviceId(GPUMachineManager(), gpu_id)
           .ValueOrDie();
@@ -40,17 +40,12 @@ int64 GetTotalGPUMemory(PlatformGpuId gpu_id) {
   return total_memory;
 }
 
-Status GetComputeCapability(PlatformGpuId gpu_id, int* cc_major,
-                            int* cc_minor) {
-  se::StreamExecutor* se =
-      DeviceIdUtil::ExecutorForPlatformDeviceId(GPUMachineManager(), gpu_id)
-          .ValueOrDie();
-  if (!se->GetDeviceDescription().cuda_compute_capability(cc_major, cc_minor)) {
-    *cc_major = 0;
-    *cc_minor = 0;
-    return errors::Internal("Failed to get compute capability for device.");
-  }
-  return Status::OK();
+se::CudaComputeCapability GetComputeCapability() {
+  return DeviceIdUtil::ExecutorForPlatformDeviceId(GPUMachineManager(),
+                                                   PlatformDeviceId(0))
+      .ValueOrDie()
+      ->GetDeviceDescription()
+      .cuda_compute_capability();
 }
 
 void ExpectErrorMessageSubstr(const Status& s, StringPiece substr) {
@@ -130,7 +125,7 @@ TEST_F(GPUDeviceTest, InvalidGpuId) {
       opts, kDeviceNamePrefix, &devices);
   EXPECT_EQ(status.code(), error::INVALID_ARGUMENT);
   ExpectErrorMessageSubstr(status,
-                           "'visible_device_list' listed an invalid GPU id");
+                           "'visible_device_list' listed an invalid Device id");
 }
 
 TEST_F(GPUDeviceTest, DuplicateEntryInVisibleDeviceList) {
@@ -236,7 +231,7 @@ TEST_F(GPUDeviceTest, SingleVirtualDeviceWithInvalidPriority) {
 #else
     // Priority outside the range (-2, 0) for NVidia GPUs
     SessionOptions opts =
-        MakeSessionOptions("0", 0, 1, {{123, 456}}, {{-3, 0}});
+        MakeSessionOptions("0", 0, 1, {{123, 456}}, {{-9999, 0}});
 #endif
     std::vector<std::unique_ptr<Device>> devices;
     Status status = DeviceFactory::GetFactory("GPU")->CreateDevices(
@@ -249,7 +244,7 @@ TEST_F(GPUDeviceTest, SingleVirtualDeviceWithInvalidPriority) {
         " virtual device 0 on GPU# 0");
 #else
     ExpectErrorMessageSubstr(
-        status, "Priority -3 is outside the range of supported priorities");
+        status, "Priority -9999 is outside the range of supported priorities");
 #endif
   }
   {
@@ -349,10 +344,7 @@ TEST_F(GPUDeviceTest, MultipleVirtualDevicesWithPriority) {
 // Enabling unified memory on pre-Pascal GPUs results in an initialization
 // error.
 TEST_F(GPUDeviceTest, UnifiedMemoryUnavailableOnPrePascalGpus) {
-  int cc_major, cc_minor;
-  TF_ASSERT_OK(GetComputeCapability(PlatformGpuId(0), &cc_major, &cc_minor));
-  // Exit early while running on Pascal or later GPUs.
-  if (cc_major >= 6) {
+  if (GetComputeCapability().IsAtLeast(se::CudaComputeCapability::PASCAL_)) {
     return;
   }
 
@@ -371,12 +363,10 @@ TEST_F(GPUDeviceTest, UnifiedMemoryUnavailableOnPrePascalGpus) {
 // more memory than what is available on the device.
 TEST_F(GPUDeviceTest, UnifiedMemoryAllocation) {
   static constexpr double kGpuMemoryFraction = 1.2;
-  static constexpr PlatformGpuId kPlatformGpuId(0);
+  static constexpr PlatformDeviceId kPlatformDeviceId(0);
 
-  int cc_major, cc_minor;
-  TF_ASSERT_OK(GetComputeCapability(kPlatformGpuId, &cc_major, &cc_minor));
   // Exit early if running on pre-Pascal GPUs.
-  if (cc_major < 6) {
+  if (!GetComputeCapability().IsAtLeast(se::CudaComputeCapability::PASCAL_)) {
     LOG(INFO)
         << "Unified memory allocation is not supported with pre-Pascal GPUs.";
     return;
@@ -389,8 +379,9 @@ TEST_F(GPUDeviceTest, UnifiedMemoryAllocation) {
   ASSERT_EQ(1, devices.size());
 
   int64 memory_limit = devices[0]->attributes().memory_limit();
-  ASSERT_EQ(memory_limit, static_cast<int64>(GetTotalGPUMemory(kPlatformGpuId) *
-                                             kGpuMemoryFraction));
+  ASSERT_EQ(memory_limit,
+            static_cast<int64>(GetTotalGPUMemory(kPlatformDeviceId) *
+                               kGpuMemoryFraction));
 
   AllocatorAttributes allocator_attributes = AllocatorAttributes();
   allocator_attributes.set_gpu_compatible(true);

@@ -2,7 +2,7 @@ load("//tensorflow/core/platform:build_config.bzl", "tf_platform_alias")
 
 package(
     default_visibility = ["//visibility:public"],
-    licenses = ["notice"],  # Apache 2.0
+    licenses = ["notice"],
 )
 
 cc_library(
@@ -142,7 +142,10 @@ cc_library(
 cc_library(
     name = "model_builder",
     srcs = ["model_builder.cc"],
-    hdrs = ["model_builder.h"],
+    hdrs = [
+        "model_builder.h",
+        "model_builder_internal.h",
+    ],
     deps = [
         ":data_type",
         ":lstm_parser",
@@ -150,6 +153,7 @@ cc_library(
         ":model_builder_helper",
         ":model_transformer",
         ":object_reader",
+        ":operation_parser",
         ":operations",
         ":shape",
         ":status",
@@ -158,7 +162,9 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "//tensorflow/lite/core/api",
         "//tensorflow/lite/delegates:utils",
+        "//tensorflow/lite:framework_lib",
         "//tensorflow/lite:kernel_api",
         "//tensorflow/lite:util",
         "//tensorflow/lite/c:common",
@@ -175,6 +181,7 @@ cc_test(
     deps = [
         ":data_type",
         ":model_builder",
+        ":operation_parser",
         ":shape",
         ":tensor",
         "//tensorflow/lite:framework",
@@ -237,6 +244,8 @@ cc_library(
         "//tensorflow/lite/c:common",
         "//tensorflow/lite/delegates:utils",
         "//tensorflow/lite/kernels:kernel_util",
+        "//tensorflow/lite/tools/optimize/sparsity:format_converter",
+        "@FP16",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/strings",
     ],
@@ -369,6 +378,22 @@ cc_test(
     deps = [
         ":memory_management",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "operation_parser",
+    srcs = ["operation_parser.cc"],
+    hdrs = ["operation_parser.h"],
+    deps = [
+        ":model",
+        ":object_reader",
+        ":operations",
+        ":shape",
+        ":status",
+        "//tensorflow/lite/c:common",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
     ],
 )
 

@@ -268,10 +268,25 @@ bool StreamExecutor::GetConvolveAlgorithms(
   if (!dnn_support) {
     return false;
   }
-  int cc_major, cc_minor;
-  GetDeviceDescription().cuda_compute_capability(&cc_major, &cc_minor);
-  return dnn_support->GetConvolveAlgorithms(with_winograd_nonfused, cc_major,
-                                            cc_minor, out_algorithms);
+  return dnn_support->GetConvolveAlgorithms(
+      with_winograd_nonfused, GetDeviceDescription().cuda_compute_capability(),
+      out_algorithms);
+}
+
+bool StreamExecutor::GetConvolveExecutionPlans(
+    dnn::ConvolutionKind kind, dnn::DataType element_type, Stream *stream,
+    const dnn::BatchDescriptor &input_descriptor,
+    const dnn::FilterDescriptor &filter_descriptor,
+    const dnn::BatchDescriptor &output_descriptor,
+    const dnn::ConvolutionDescriptor &convolution_descriptor,
+    std::vector<std::unique_ptr<dnn::ConvolveExecutionPlan>> *out_exec_plans) {
+  dnn::DnnSupport *dnn_support = AsDnn();
+  if (!dnn_support) {
+    return false;
+  }
+  return dnn_support->GetConvolveExecutionPlans(
+      kind, element_type, stream, input_descriptor, filter_descriptor,
+      output_descriptor, convolution_descriptor, out_exec_plans);
 }
 
 bool StreamExecutor::GetMIOpenConvolveAlgorithms(
@@ -309,10 +324,9 @@ bool StreamExecutor::GetConvolveBackwardDataAlgorithms(
   if (!dnn_support) {
     return false;
   }
-  int cc_major, cc_minor;
-  GetDeviceDescription().cuda_compute_capability(&cc_major, &cc_minor);
   return dnn_support->GetConvolveBackwardDataAlgorithms(
-      with_winograd_nonfused, cc_major, cc_minor, out_algorithms);
+      with_winograd_nonfused, GetDeviceDescription().cuda_compute_capability(),
+      out_algorithms);
 }
 
 bool StreamExecutor::GetConvolveBackwardFilterAlgorithms(
@@ -322,10 +336,9 @@ bool StreamExecutor::GetConvolveBackwardFilterAlgorithms(
   if (!dnn_support) {
     return false;
   }
-  int cc_major, cc_minor;
-  GetDeviceDescription().cuda_compute_capability(&cc_major, &cc_minor);
   return dnn_support->GetConvolveBackwardFilterAlgorithms(
-      with_winograd_nonfused, cc_major, cc_minor, out_algorithms);
+      with_winograd_nonfused, GetDeviceDescription().cuda_compute_capability(),
+      out_algorithms);
 }
 
 bool StreamExecutor::GetBlasGemmAlgorithms(
@@ -863,6 +876,10 @@ bool StreamExecutor::UnregisterTraceListener(TraceListener *listener) {
 
 absl::optional<AllocatorStats> StreamExecutor::GetAllocatorStats() {
   return implementation_->GetAllocatorStats();
+}
+
+bool StreamExecutor::ClearAllocatorStats() {
+  return implementation_->ClearAllocatorStats();
 }
 
 template <typename TraceCallT, typename... ArgsT>

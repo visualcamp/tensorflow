@@ -170,6 +170,7 @@ std::set<string> GetOpsFormatAgnostic() {
                                           "Polygamma",
                                           "QuantizeAndDequantizeV2",
                                           "QuantizeAndDequantizeV3",
+                                          "QuantizeAndDequantizeV4",
                                           "Pow",
                                           "Real",
                                           "RealDiv",
@@ -2280,11 +2281,6 @@ Status LayoutOptimizer::Optimize(Cluster* cluster, const GrapplerItem& item,
     *output = item.graph;
   }
   return status;
-}
-
-void LayoutOptimizer::Feedback(Cluster* cluster, const GrapplerItem& item,
-                               const GraphDef& optimize_output, double result) {
-  // Nothing to do for LayoutOptimizer.
 }
 
 }  // end namespace grappler

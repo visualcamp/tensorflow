@@ -194,6 +194,10 @@ CollectiveAdapter* MakeCollectiveAdapter(Tensor* output, int num_chunks,
                                          Allocator* allocator,
                                          bool align_chunks) {
   switch (output->dtype()) {
+    case DT_BFLOAT16:
+      return new CollectiveAdapterImpl<Eigen::bfloat16>(
+          output, num_chunks, allocator, align_chunks);
+      break;
     case DT_HALF:
       return new CollectiveAdapterImpl<Eigen::half>(output, num_chunks,
                                                     allocator, align_chunks);
@@ -264,7 +268,7 @@ Status BaseCollectiveExecutor::GetStatus(const Status& s) {
 }
 
 void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
-                                          const CollectiveParams& col_params,
+                                          const CollectiveParams* col_params,
                                           const string& exec_key,
                                           StatusCallback done) {
   // See CompleteParamsAsync() how done() and the timeout callback interacts.
@@ -281,7 +285,7 @@ void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
     }
   };
   auto timeout_microseconds = static_cast<int64>(
-      col_params.instance.impl_details.timeout_seconds * 1'000'000);
+      col_params->instance.impl_details.timeout_seconds * 1'000'000);
   if (timeout_microseconds > 0) {
     // TODO(xldrx): Share the timeout watchdog thread among collectives.
     SchedNonBlockingClosureAfter(
@@ -297,15 +301,15 @@ void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
   }
 
   Tensor* output = ctx->mutable_output(0);
-  const Tensor* input = (col_params.instance.type == REDUCTION_COLLECTIVE ||
-                         col_params.instance.type == GATHER_COLLECTIVE ||
-                         col_params.instance.type == PERMUTE_COLLECTIVE ||
-                         (col_params.instance.type == BROADCAST_COLLECTIVE &&
-                          col_params.is_source))
+  const Tensor* input = (col_params->instance.type == REDUCTION_COLLECTIVE ||
+                         col_params->instance.type == GATHER_COLLECTIVE ||
+                         col_params->instance.type == PERMUTE_COLLECTIVE ||
+                         (col_params->instance.type == BROADCAST_COLLECTIVE &&
+                          col_params->is_source))
                             ? &ctx->input(0)
                             : nullptr;
   CollectiveImplementationInterface* col_impl = nullptr;
-  Status status = CreateCollective(col_params, &col_impl);
+  Status status = CreateCollective(*col_params, &col_impl);
   if (!status.ok()) {
     done_safe(status);
     DCHECK_EQ(nullptr, col_impl);
@@ -346,7 +350,6 @@ void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
 void BaseCollectiveExecutor::CompleteParamsAsync(
     const DeviceAttributes& device, CollectiveParams* cp,
     CancellationManager* cancel_mgr, StatusCallback done) {
-  cp->group.gpu_ring_order = *gpu_ring_order_;
   // We need to make sure that when the timeout callback executes,
   // CollectiveExecutor and CollectiveExecutorMgr are both alive. After done()
   // is called, CollectiveExecutorMgr may be destructed and we don't have a way
@@ -411,6 +414,16 @@ Status BaseCollectiveExecutor::CreateCollective(
         // TODO(b/139421603): enable int32 all-reduce on GPU.
         return errors::Internal(
             "Collective all-reduce does not support datatype DT_INT32 on "
+            "DEVICE_GPU");
+      } else {
+        return CollectiveRegistry::Lookup(
+            col_params.instance.impl_details.collective_name, col_impl);
+      }
+    case DT_BFLOAT16:
+      if (col_params.group.device_type == DEVICE_GPU &&
+          col_params.instance.type == REDUCTION_COLLECTIVE) {
+        return errors::Internal(
+            "Collective all-reduce does not support datatype DT_BFLOAT16 on "
             "DEVICE_GPU");
       } else {
         return CollectiveRegistry::Lookup(

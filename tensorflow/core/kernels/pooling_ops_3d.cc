@@ -141,6 +141,11 @@ class Pooling3DOp : public UnaryOp<T> {
     OP_REQUIRES(context, ksize_.size() == 5,
                 errors::InvalidArgument("Sliding window ksize field must "
                                         "specify 5 dimensions"));
+    bool non_negative =
+        std::all_of(ksize_.begin(), ksize_.end(), [](int k) { return k > 0; });
+    OP_REQUIRES(context, non_negative,
+                errors::InvalidArgument("Sliding window ksize field must "
+                                        "have non-negative dimensions"));
     OP_REQUIRES_OK(context, context->GetAttr("strides", &stride_));
     OP_REQUIRES(context, stride_.size() == 5,
                 errors::InvalidArgument("Sliding window stride field must "
@@ -361,6 +366,19 @@ class MaxPooling3dGradOp : public OpKernel {
 
     OP_REQUIRES_OK(context, Get3dOutputSize(input_size, window, stride,
                                             padding_, &out, &padding));
+
+    const int64_t depth = GetTensorDim(tensor_in, data_format_, 'C');
+    const int64_t in_batch = GetTensorDim(tensor_in, data_format_, 'N');
+    TensorShape out_shape = ShapeFromFormat(data_format_, in_batch,
+                                            {{out[2], out[1], out[0]}}, depth);
+    OP_REQUIRES(
+        context, tensor_out.shape() == out_shape,
+        errors::InvalidArgument("Expected orig_output shape to be ", out_shape,
+                                ", but got ", tensor_out.shape()));
+    OP_REQUIRES(context, out_backprop.shape() == out_shape,
+                errors::InvalidArgument("Expected grad shape to be ", out_shape,
+                                        ", but got ", out_backprop.shape()));
+
     LaunchMaxPooling3dGradOp<Device, T>::launch(
         context, tensor_in, tensor_out, out_backprop, window, stride, out,
         padding, data_format_, input_backprop);
@@ -383,6 +401,19 @@ struct LaunchAvgPooling3dGradOp<CPUDevice, T> {
                      const std::array<int64, 3>& output_shape,
                      const std::array<int64, 3>& padding,
                      TensorFormat data_format, Tensor* output) {
+    OP_REQUIRES(
+        context, tensor_in_shape.dim_size(0) == out_backprop.dim_size(0),
+        errors::InvalidArgument(
+            "Expected first dimension of tensor_in_shape and "
+            "out_backprop to match, got ",
+            tensor_in_shape.dim_size(0), " and ", out_backprop.dim_size(0)));
+    OP_REQUIRES(
+        context, tensor_in_shape.dim_size(4) == out_backprop.dim_size(4),
+        errors::InvalidArgument(
+            "Expected last dimension of tensor_in_shape and "
+            "out_backprop to match, got ",
+            tensor_in_shape.dim_size(4), " and ", out_backprop.dim_size(4)));
+
     output->flat<T>().setZero();
     std::array<int64, 3> input_size = {{tensor_in_shape.dim_size(3),
                                         tensor_in_shape.dim_size(2),
@@ -693,10 +724,43 @@ class MaxPooling3dGradGradOp : public OpKernel {
 
     Pool3dParameters params{context,  ksize_,       stride_,
                             padding_, data_format_, tensor_in.shape()};
+    if (!context->status().ok()) return;  // params is invalid
+    OP_REQUIRES(context, tensor_out.shape() == params.forward_output_shape(),
+                errors::InvalidArgument("Expected orig_output shape to be ",
+                                        params.forward_output_shape(),
+                                        ", but got ", tensor_out.shape()));
+    OP_REQUIRES(
+        context, out_grad_backprop.shape() == tensor_in.shape(),
+        errors::InvalidArgument("Expected grad shape to be ", tensor_in.shape(),
+                                ", but got ", out_grad_backprop.shape()));
 
     Tensor* output = nullptr;
     OP_REQUIRES_OK(context, context->forward_input_or_allocate_output(
                                 {2}, 0, tensor_out.shape(), &output));
+
+    // Given access patterns in LaunchMaxPooling3dGradGradOp, these tensors must
+    // have elements.
+    OP_REQUIRES(context, tensor_in.NumElements() > 0,
+                errors::InvalidArgument("received empty tensor tensor_in: ",
+                                        tensor_in.DebugString()));
+    OP_REQUIRES(context, tensor_out.NumElements() > 0,
+                errors::InvalidArgument("received empty tensor tensor_out: ",
+                                        tensor_out.DebugString()));
+    OP_REQUIRES(
+        context, out_grad_backprop.NumElements() > 0,
+        errors::InvalidArgument("received empty tensor out_grad_backprop: ",
+                                out_grad_backprop.DebugString()));
+    OP_REQUIRES(context,
+                tensor_in.NumElements() == out_grad_backprop.NumElements(),
+                errors::InvalidArgument("tensor_in and out_grad_backprop must "
+                                        "have same number of elements, got <",
+                                        tensor_in.DebugString(), "> and <",
+                                        out_grad_backprop.DebugString(), ">"));
+    OP_REQUIRES(
+        context, tensor_out.NumElements() == output->NumElements(),
+        errors::InvalidArgument(
+            "tensor_out and output must have same number of elements, got <",
+            tensor_out.DebugString(), "> and <", output->DebugString(), ">"));
 
     LaunchMaxPooling3dGradGradOp<Device, T>::launch(
         context, params, tensor_in, tensor_out, out_grad_backprop, output);

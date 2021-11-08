@@ -15,10 +15,15 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/copy_insertion.h"
 
+#include <optional>
+#include <sstream>
+
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/types/any.h"
 #include "tensorflow/compiler/xla/service/dump.h"
 #include "tensorflow/compiler/xla/service/hlo_alias_analysis.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
@@ -332,35 +337,6 @@ Status AddCopiesForWhile(const HloAliasAnalysis& alias_analysis,
   return Status::OK();
 }
 
-// We add copies for all non-phi indices of the true and false computation
-// roots, in order to resolve interference. We later rely on
-// RemoveUnnecessaryCopies to drop the unnecessary ones.
-Status AddCopiesForConditional(const HloAliasAnalysis& alias_analysis,
-                               HloInstruction* conditional) {
-  VLOG(2) << "Adding copies for kConditional instruction "
-          << conditional->name();
-  ShapeTree<bool> indices_to_copy(conditional->shape());
-  TF_RET_CHECK(conditional->opcode() == HloOpcode::kConditional);
-  if (!IndicesToCopyForConditional(alias_analysis.dataflow_analysis(),
-                                   conditional, &indices_to_copy)) {
-    VLOG(2) << "No copies necessary for kWhile instruction "
-            << conditional->name();
-    return Status::OK();
-  }
-  for (HloComputation* computation : conditional->branch_computations()) {
-    HloInstruction* root = computation->root_instruction();
-    std::vector<HloInstruction*> users = root->users();
-    TF_ASSIGN_OR_RETURN(
-        HloInstruction * deep_copy,
-        computation->DeepCopyInstruction(root, &indices_to_copy));
-    for (HloInstruction* user : users) {
-      TF_RETURN_IF_ERROR(root->ReplaceUseWith(user, deep_copy));
-    }
-    computation->set_root_instruction(deep_copy);
-  }
-  return Status::OK();
-}
-
 // Add copies for the operands of in-place operations. RemoveUnnecessaryCopies
 // will remove the unnecessary copies.
 Status AddCopiesForInPlaceOperation(const HloAliasAnalysis& alias_analysis,
@@ -475,6 +451,453 @@ Status StripControlDependenciesFrom(HloInstruction* instruction) {
   return Status::OK();
 }
 
+class LiveRangeRegions {
+ public:
+  struct InstructionInfo {
+    InstructionInfo() : value_definition(nullptr), is_definition(false) {}
+
+    // The instruction that defines the value being used. It basically saves
+    // the defining instruction of each HloValue.
+    HloInstruction* value_definition;
+    // Whether the instruction defines a new value (or merely uses one). This
+    // basically remembers whether the instruction actually creates an HloValue
+    // or merely uses one, from a collection of given HloValues. Note that if
+    // is_definition = true, it merely says the instruction creates a new
+    // HloValue with or without defining a new one. For example, kAdd create a
+    // new HloValue (can be value_definition), but tuples or get-tuple-element,
+    // create a new HloValue aliasing without defining a new value (cannot be
+    // value_definition).
+    bool is_definition;
+  };
+  // Map instructions that use a value to the defining instruction of the value.
+  // Because all values must belong to the same live range, an instruction can
+  // have at most a single value-defining instruction; otherwise the multiple
+  // incoming active values would share a single buffer, which is not allowed.
+  // The value-defining and value-use instructions do not have to belong to the
+  // same computation, but the value use needs to be nested within the defining
+  // computation.
+  typedef absl::flat_hash_map<HloInstruction*, InstructionInfo> InstructionMap;
+  typedef std::pair<HloInstruction*, InstructionInfo> InstructionEntry;
+  // Map each computation to its immediately contained instructions.
+  typedef absl::flat_hash_map<const HloComputation*, InstructionMap>
+      ComputationMap;
+
+  InstructionMap& operator[](const HloComputation* computation) {
+    if (computation_map_.find(computation) == computation_map_.end()) {
+      computation_vector_.push_back(computation);
+    }
+    return computation_map_[computation];
+  }
+
+  const InstructionMap& operator[](const HloComputation* computation) const {
+    ComputationMap::const_iterator p = computation_map_.find(computation);
+    CHECK(p != computation_map_.end());
+    return p->second;
+  }
+  ComputationMap::const_iterator begin() const {
+    return computation_map_.begin();
+  }
+  ComputationMap::const_iterator end() const { return computation_map_.end(); }
+  int64 size() const {
+    CHECK_EQ(computation_vector_.size(), computation_map_.size());
+    return computation_vector_.size();
+  }
+  bool empty() const { return size() == 0; }
+  const HloComputation* Computation(int64 index) const {
+    return computation_vector_[index];
+  }
+  bool contains(const HloInstruction* instr) const {
+    CHECK_NE(instr, nullptr);
+    auto* computation = instr->parent();
+    auto p = computation_map_.find(computation);
+    if (p == computation_map_.end()) {
+      return false;
+    }
+    auto instr_map = (*p).second;
+    return instr_map.find(instr) != instr_map.end();
+  }
+
+ private:
+  ComputationMap computation_map_;
+  absl::InlinedVector<const HloComputation*, 5> computation_vector_;
+};
+// Compute the set of instructions where values are alive and organize these
+// instructions by separating them into their respective computations.
+LiveRangeRegions ComputeLiveRangeRegions(
+    absl::Span<const HloValue* const> values) {
+  LiveRangeRegions live_range;
+
+  for (auto value : values) {
+    HloInstruction* def_op = value->instruction();
+    HloComputation* def_parent = def_op->parent();
+    live_range[def_parent][def_op].is_definition = true;
+    for (const auto& use : value->uses()) {
+      auto* use_op = use.instruction;
+      HloComputation* use_parent = use_op->parent();
+      live_range[use_parent][use_op].value_definition = def_op;
+    }
+  }
+  return live_range;
+}
+
+namespace {
+// Represent relations between the locations of two regions of instructions,
+// each region can include 0-n instructions.
+class Relation {
+ public:
+  enum RuntimeOrder {
+    // Indicate that there is no overlap whatsoever between the two regions.
+    kNoOverlap = 0,
+    // Indicate that the first region includes the same set of instructions as
+    // the second region.
+    kSameInstr = 1,
+    // Indicate that the first region is entirely before the second region
+    // starts.
+    kBeforeStart = 2,
+    // Indicate that the first region is before the second region ends.
+    kBeforeStartOrSameInstr = kBeforeStart | kSameInstr,
+    // Indicate that the first region is entirely after the second region ends.
+    kAfterEnd = 4,
+    // Indicate that the first region is after the second region
+    // starts, with some instructions before the second region ends.
+    kAfterEndOrSameInstr = kAfterEnd | kSameInstr,
+    // Indicate that the first region overlaps with the second one, but share no
+    // common instructions.
+    kBeforeStartOrAfterEnd = kBeforeStart | kAfterEnd,
+    // Indicate that the first region overlaps with the second one, and have
+    // some common instructions.
+    kBeforeOrAfterOrOverlap = kBeforeStart | kAfterEnd | kSameInstr,
+  };
+  Relation() : intercept_def_use_(false) {}
+  explicit Relation(RuntimeOrder order, bool intercept_def_use = false)
+      : intercept_def_use_(intercept_def_use) {
+    orders_.push_back(order);
+  }
+  Relation(const Relation& that)
+      : intercept_def_use_(that.intercept_def_use_), orders_(that.orders_) {}
+
+  // Return whether the runtime ordering may imply interception, assuming it
+  // models the relation between a modifying and a use instruction.
+  bool UseImpliesInterception() const {
+    CHECK_EQ(orders_.size(), 1);
+    return UseImpliesInterception(orders_[0]);
+  }
+  // Return whether the runtime ordering may imply interception, assuming it
+  // models the relation between a modifying and a definition instruction.
+  bool DefinitionImpliesInterception() const {
+    CHECK_EQ(orders_.size(), 1);
+    return DefinitionImpliesInterception(orders_[0]);
+  }
+  // Return whether the current relation models a modifying instruction that
+  // intercepts the dataflow of another live range region.
+  bool InterceptDefUse() const { return intercept_def_use_; }
+  // Update interception state to the given value.
+  void UpdateInterception(bool value) {
+    CHECK_EQ(orders_.size(), 1);
+    intercept_def_use_ = value;
+  }
+  // Return whether the current relation implies two overlapping regions.
+  bool RuntimeOrderOverlap() const {
+    return absl::c_any_of(orders_, ImpliesOverlap);
+  }
+  std::string ToString() const {
+    return absl::StrCat("Interception = ", intercept_def_use_, ";",
+                        absl::StrJoin(orders_, ","));
+  }
+
+  // Summarize additional relations into a single runtime ordering, assuming
+  // both relations are modeling constraints of the same source instruction.
+  void UnionRelationFromSameSource(const Relation& rel) {
+    CHECK_LE(orders_.size(), 1);
+    CHECK_EQ(rel.orders_.size(), 1);
+    if (orders_.empty()) {
+      orders_.push_back(rel.orders_[0]);
+    } else {
+      orders_[0] = Union(orders_[0], rel.orders_[0]);
+    }
+    intercept_def_use_ = intercept_def_use_ || rel.intercept_def_use_;
+  }
+
+  // Summarize additional relations into disjoint runtime orderings, assuming
+  // the relations are modeling constraints of different source instructions.
+  void UnionRelationFromDifferentSource(const Relation& rel) {
+    CHECK_EQ(rel.orders_.size(), 1);
+    intercept_def_use_ = intercept_def_use_ || rel.intercept_def_use_;
+    for (auto& local_order : orders_) {
+      if (OverwriteIfSubsume(rel.orders_[0], &local_order)) {
+        return;
+      }
+    }
+    orders_.push_back(rel.orders_[0]);
+  }
+
+ private:
+  // Indicate that the second region may intercept the def-use dataflow of the
+  // first region, if their buffers are combined.
+  bool intercept_def_use_;
+  // Remember the different runtime orderings of different instructions.
+  absl::InlinedVector<RuntimeOrder, 4> orders_;
+
+  static RuntimeOrder Union(RuntimeOrder o1, RuntimeOrder o2) {
+    return static_cast<Relation::RuntimeOrder>(o1 | o2);
+  }
+  static bool ImpliesOverlap(RuntimeOrder o) {
+    return o >= RuntimeOrder::kBeforeStartOrAfterEnd;
+  }
+  static bool DefinitionImpliesInterception(RuntimeOrder definition) {
+    // Here kAfterEnd is what we want. Alternatively we conservatively list
+    // kBeforeStartOrAfterEnd, which currently indicates the definition and
+    // the intercepting instruction are in exclusive branches, where
+    // kAfterEnd could happen if the branches are inside a loop. We don't
+    // include kBeforeOrAfterOrOverlap because it is currently not used to
+    // describe relations between individual instructions (see
+    // ComputeRuntimeOrdering).
+    return (definition == kAfterEnd || definition == kBeforeStartOrAfterEnd);
+  }
+  static bool UseImpliesInterception(RuntimeOrder use) {
+    // Here kBeforeStart is what we want, and kBeforeStartOrAfterEnd is listed
+    // conservatively, as explained above in DefinitionImpliesInterception.
+    return (use == kBeforeStart || use == kBeforeStartOrAfterEnd);
+  }
+  // Returns whether ordering constraint o1 includes o2 as a subset, when they
+  // represent runtime orderings (interleavings) of two different regions.
+  static bool Subsume(RuntimeOrder o1, RuntimeOrder o2) {
+    return Union(o1, o2) == o1;
+  }
+  // Overwrites o1 with o2 if o2 subsumes o1 (as defined above by the Subsume
+  // function). Return whether o2 is subsumed by the new value in o1.
+  static bool OverwriteIfSubsume(RuntimeOrder o2, RuntimeOrder* o1) {
+    if (*o1 == o2) {
+      return true;
+    }
+    CHECK_NE(o1, nullptr);
+    // Overwrite o1 with o2 if it is subsumed by o2.
+    if (Subsume(o2, *o1)) {
+      *o1 = o2;
+      return true;
+    } else if (Subsume(*o1, o2)) {
+      // If o2 is already subsumed by o1, do nothing.
+      return true;
+    }
+    // If neither o1 nor o2 is subsumed by the other, return false, so that o2
+    // will be inserted as a separate entry representing all possible orderings.
+    return false;
+  }
+};
+
+class ComputeRelativeLocation {
+ public:
+  typedef LiveRangeRegions::InstructionEntry InstructionEntry;
+  typedef std::pair<bool, Relation> SavedRelation;
+  explicit ComputeRelativeLocation(const HloOrdering& ordering)
+      : ordering_(ordering) {}
+
+  // Compute locationing constraints between two instructions. Here entry2 is
+  // the source instruction, in that the returned value describes the relation
+  // of entry2 in terms of whether it is before or after entry1, and whether it
+  // can intercept the def-use data flow of entry1.
+  Relation Compute(const InstructionEntry& entry1,
+                   const InstructionEntry& entry2, bool instr2_can_modify) {
+    auto def = entry1.second.value_definition;
+    auto use = entry1.first;
+    auto rel = ComputeRuntimeOrdering(entry2, entry1);
+    if (def == nullptr || !instr2_can_modify) {
+      return Save(entry1, entry2, rel);
+    }
+    // If the definition and use are parameter and return (root) of the parent
+    // computation, then any modification is considered intercepting.
+    if (def->opcode() == HloOpcode::kParameter &&
+        use == use->parent()->root_instruction()) {
+      VLOG(3) << "Setting interception due to parameter/root relation\n";
+      rel.UpdateInterception(true);
+      return Save(entry1, entry2, rel);
+    }
+    if (rel.UseImpliesInterception()) {
+      VLOG(3) << "considering interception for " << def->ToString()
+              << " with use:" << entry1.first->ToString() << "\n";
+      LiveRangeRegions::InstructionInfo info;
+      info.is_definition = true;
+      LiveRangeRegions::InstructionEntry def_entry(def, info);
+      auto rel2 = ComputeRuntimeOrdering(entry2, def_entry);
+      VLOG(3) << "Intercepting relations: " << rel2.ToString() << " vs "
+              << rel.ToString();
+      if (rel2.DefinitionImpliesInterception()) {
+        rel.UpdateInterception(true);
+      }
+    }
+    return Save(entry1, entry2, rel);
+  }
+
+  // Return the relative locations (defined above) of range2 in relation to
+  // instructions in range1. Return kNoOverlap if range2 is outside of range1.
+  Relation Compute(const LiveRangeRegions& range1,
+                   const LiveRangeRegions& range2) {
+    Relation dir_src_dest;
+    for (int64 index = 0; index < range1.size(); index++) {
+      auto* computation1 = range1.Computation(index);
+      for (const auto& computation_entry2 : range2) {
+        auto* computation2 = computation_entry2.first;
+        for (auto instr_entry2 : computation_entry2.second) {
+          if (!ordering_.call_graph().Dominates(computation1, computation2)) {
+            continue;
+          }
+          VLOG(3) << "Locationing " << instr_entry2.first->ToString();
+          // Saves relations between instr2 and other instructions in range1.
+          bool instr2_can_modify =
+              InstructionCanIntercept(instr_entry2, range1);
+          Relation instr2_relation;
+          for (auto instr_entry1 : range1[computation1]) {
+            auto rel = Compute(instr_entry1, instr_entry2, instr2_can_modify);
+            VLOG(3) << "new relation with:" << instr_entry1.first->ToString()
+                    << " = " << rel.ToString() << "\n";
+            instr2_relation.UnionRelationFromSameSource(rel);
+            VLOG(3) << "instr2 relation:" << instr2_relation.ToString() << "\n";
+          }
+          dir_src_dest.UnionRelationFromDifferentSource(instr2_relation);
+          VLOG(3) << "Resulting relation : " << dir_src_dest.ToString() << "\n";
+        }
+      }
+    }
+    return dir_src_dest;
+  }
+
+ private:
+  static bool AlwaysForceInterception(HloInstruction* instr) {
+    // The following communication operations can have some unexpected side
+    // effects, when synchronizing across processes. Therefore, we
+    // conservatively try provide dedicated buffers to these operations instead
+    // of allowing them to share buffers with other operations, as the reuse may
+    // cause unexpected interferences.
+    if (HloDataflowAnalysis::IsAsynchronousOperationStart(instr->opcode()) ||
+        HloDataflowAnalysis::IsAsynchronousOperationDone(instr->opcode())) {
+      return true;
+    }
+    switch (instr->opcode()) {
+      // TODO(b/190903339): It appears that collectivePermute needs to be
+      // followed by a copy when escaping through a computation root.
+      case HloOpcode::kCollectivePermute:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // Returns whether the given instr may intercept the def-use flow of another
+  // ongoing live range if its buffer is combined with the other live range.
+  // The function should return true if instr creates a new HloValue that could
+  // overwrite an existing HloValue in the combined buffer.
+  // More specifically, here we are looking for operations that create new
+  // values, e.g., add, subtract, in contrast to HLOs that merely create
+  // aliasings among existing values, e.g., tuple, get-tuple-element. Any of the
+  // new values created by operations such as add or subtract, when included as
+  // definition operations in a live range, are aliases of the buffer to be
+  // allocated to the live range and so are treated as they may be modifying the
+  // targeting buffer.
+  bool InstructionCanIntercept(const InstructionEntry& entry,
+                               const LiveRangeRegions& region) {
+    auto instr = entry.first;
+    if (!entry.second.is_definition) {
+      // If the instruction only uses the value, it can intercept only if it
+      // modifies the buffer in place.
+      return !HloDataflowAnalysis::GetInPlaceInputOutputPairs(instr).empty();
+    }
+    switch (instr->opcode()) {
+      // If the copy instruction is used to connect two live range regions,
+      // it does not overwrite the combined buffer with new values.
+      case HloOpcode::kCopy:
+        // Checking the copy simply copies from the other live range with no
+        // layout conflicts.
+        if (region.contains(instr->operand(0)) &&
+            ShapeUtil::Equal(instr->shape(), instr->operand(0)->shape())) {
+          return false;  // Cannot intercept.
+        }
+        return true;
+      // The following operations merely create aliases among the HloValues.
+      case HloOpcode::kParameter:
+      case HloOpcode::kTuple:
+      case HloOpcode::kGetTupleElement:
+      // Here we consider all the compound operations (e.g., conditionals and
+      // while loops) as if they do not modify any HloValue, with the argument
+      // being that any value modifying operation contained inside will be
+      // considered separately to make sure the kIntercept relation being
+      // recorded as appropriate. Since the compound operations may or may not
+      // modify, not treating them as value modifying would make the algorithm
+      // less conservative.
+      case HloOpcode::kWhile:
+      case HloOpcode::kCall:
+      case HloOpcode::kConditional:
+      case HloOpcode::kTupleSelect:
+        return false;
+      default:
+        return true;
+    }
+    return true;
+  }
+
+  SavedRelation AlreadyComputed(const InstructionEntry& entry1,
+                                const InstructionEntry& entry2) {
+    auto p2 = saved_relations_.find(entry2.first);
+    if (p2 == saved_relations_.end()) {
+      return SavedRelation(false, Relation());
+    }
+    auto p1 = (*p2).second.find(entry1.first);
+    if (p1 == (*p2).second.end()) {
+      return SavedRelation(false, Relation());
+    }
+    return SavedRelation(true, (*p1).second);
+  }
+
+  const Relation& Save(const InstructionEntry& entry1,
+                       const InstructionEntry& entry2,
+                       const Relation& relation) {
+    auto map1 = saved_relations_[entry2.first];
+    map1[entry1.first] = relation;
+    return relation;
+  }
+
+  // Compute the runtime ordering constraints between two instructions.
+  Relation ComputeRuntimeOrdering(const InstructionEntry& instr1,
+                                  const InstructionEntry& instr2) {
+    auto saved_relation = AlreadyComputed(instr1, instr2);
+    if (saved_relation.first) {
+      return saved_relation.second;
+    }
+    bool intercept = AlwaysForceInterception(instr2.first);
+    auto constraint =
+        ordering_.GetExecutionConstraint(instr1.first, instr2.first);
+    switch (constraint) {
+      case HloOrdering::ExecutionConstraint::kIsSame:
+        return Save(
+            instr1, instr2,
+            Relation(
+                (instr1.second.is_definition == instr2.second.is_definition)
+                    ? Relation::kSameInstr
+                : (!instr1.second.is_definition) ? Relation::kBeforeStart
+                                                 : Relation::kAfterEnd,
+                intercept));
+      case HloOrdering::ExecutionConstraint::kRunBeforeEnd:
+        return Save(instr1, instr2,
+                    Relation(Relation::kBeforeStartOrSameInstr, intercept));
+      case HloOrdering::ExecutionConstraint::kRunBeforeStart:
+        return Save(instr1, instr2,
+                    Relation(Relation::kBeforeStart, intercept));
+      case HloOrdering::ExecutionConstraint::kRunAfter:
+        return Save(instr1, instr2, Relation(Relation::kAfterEnd, intercept));
+      case HloOrdering::ExecutionConstraint::kRunExclusiveBefore:
+      case HloOrdering::ExecutionConstraint::kRunExclusiveAfter:
+      case HloOrdering::ExecutionConstraint::kUnordered:
+        return Save(instr1, instr2,
+                    Relation(Relation::kBeforeStartOrAfterEnd, intercept));
+    }
+  }
+
+  const HloOrdering& ordering_;
+  absl::flat_hash_map<HloInstruction*,
+                      absl::flat_hash_map<HloInstruction*, Relation>>
+      saved_relations_;
+};
+}  // namespace
+
 // Class which tracks the HLO values within each HLO buffer in the module
 // during copy removal.
 //
@@ -514,12 +937,13 @@ class CopyRemover {
   };
 
   CopyRemover(const HloModule& module, const HloAliasAnalysis& alias_analysis,
-              const HloOrdering& ordering)
+              const HloOrdering& ordering, bool check_live_range_ordering)
       : dataflow_(alias_analysis.dataflow_analysis()), ordering_(ordering) {
     // Construct a list for each HLO buffer in the alias analysis. Maintain a
     // map from HloValue to the respective list element representing that
     // value. The map is used to construct the copy info map below.
     absl::flat_hash_map<const HloValue*, ValueNode*> value_to_node;
+    // Perform check only if the default dependence-based ordering is used.
     for (const HloBuffer& buffer : alias_analysis.buffers()) {
       // No copies should have been inserted within fused computations, so no
       // need to remove them. HloOrdering isn't compatible with HloValues inside
@@ -527,24 +951,26 @@ class CopyRemover {
       if (buffer.values().at(0)->defining_instruction()->IsFused()) {
         continue;
       }
-      // Verify values contained in the buffer are strictly ordered. This
-      // should always be the case after adding copies to eliminate
-      // interference. Specifically, the addition of the control flow edges
-      // between copies added around aliased operations (kWhile) guarantees
-      // this strict order.
-      for (const HloValue* value_a : buffer.values()) {
-        if (value_a->shape().IsToken()) {
-          // Token values have no representation and cannot interfere.
-          continue;
-        }
-        for (const HloValue* value_b : buffer.values()) {
-          if (value_a != value_b) {
-            DCHECK(ordering_.LiveRangeStrictlyBefore(*value_a, *value_b,
-                                                     dataflow_) ||
-                   ordering_.LiveRangeStrictlyBefore(*value_b, *value_a,
-                                                     dataflow_))
-                << value_a->ToShortString() << " and "
-                << value_b->ToShortString() << " are not ordered";
+      if (check_live_range_ordering) {
+        // Verify values contained in the buffer are strictly ordered. This
+        // should always be the case after adding copies to eliminate
+        // interference. Specifically, the addition of the control flow edges
+        // between copies added around aliased operations (kWhile) guarantees
+        // this strict order.
+        for (const HloValue* value_a : buffer.values()) {
+          if (value_a->shape().IsToken()) {
+            // Token values have no representation and cannot interfere.
+            continue;
+          }
+          for (const HloValue* value_b : buffer.values()) {
+            if (value_a != value_b) {
+              DCHECK(ordering_.LiveRangeStrictlyBefore(*value_a, *value_b,
+                                                       dataflow_) ||
+                     ordering_.LiveRangeStrictlyBefore(*value_b, *value_a,
+                                                       dataflow_))
+                  << value_a->ToString() << " and " << value_b->ToString()
+                  << " are not ordered";
+            }
           }
         }
       }
@@ -668,7 +1094,7 @@ class CopyRemover {
   // live range interference is introduced by the copy's elimination. If
   // elision is possible, then the internal state (value lists) are updated,
   // and true is returned. Returns false otherwise.
-  bool TryElideCopy(const HloInstruction* copy) {
+  bool TryElideCopy(const HloInstruction* copy, bool use_region_analysis) {
     VLOG(2) << "Trying to remove " << copy->name();
 
     if (!ContainsKey(copy_map_, copy)) {
@@ -734,43 +1160,70 @@ class CopyRemover {
       // {s_0, ..., s_x, d_1, ..., d_m, s_{x+1}, ..., s_n}
       //
       // Removing the copy eliminates d_0, and uses of d_0 become uses of
-      // s_x. In the above ordering, the live range of d_m must be ordered
+      // s_x. In the above ordering, the live range of d_m will be ordered
       // before the live range of s_{x+1} and the definition and all uses of
-      // s_x must be ordered before the definition of d_1. These conditions
-      // are checked below prior to elision.
+      // s_x will be ordered before the definition of d_1. To make sure the
+      // copy elision is safe, the following code checks that this ordering is
+      // valid --- in particular we check it is safe to order d_m ahead of all
+      // the liverages at and after x_{x+1}, and it is safe to order all uses
+      // of s_x before the definition of d_1, by checking the live range
+      // constraints for each pair --- we cannot skip the later checks because
+      // the live range ordering is not guranteed to be transitive --- while it
+      // may be ok to have lr_1 before lr_2, and lr_2 before lv_3 while merging
+      // their buffers, it may not be ok to merge the buffers of lr_1 and lv_3,
+      // because the exclusiveness relation of non-overlapping computations is
+      // not transitive.
       //
       // ** Technically it might be possible to have a non-interfering
       //    non-trivial interleaving of the values of the source and
-      //    destination buffers in the resulting order. However, this case is
-      //    slow and complicated to check and likely not worth it. So instead
+      //    destination buffers in the resulting order. This can be potentially
+      //    supported in the ValuesInterfere function, which performs
+      //    interference analysis at a more global scope than the alternative
+      //    LiveRangeBefore analysis which requires strict ordering of all live
+      //    ranges. Currently, however, this is not yet supported, as
       //    we simply check for the case where *all* values of the destination
       //    buffer (d_1 through d_m) are spliced into the point where the copy
       //    used to be.
       VLOG(2) << copy->name() << " defines the first value in its buffer";
-      ValueNode* next_dest = Next(*dest);
-      if (next_dest != nullptr) {
-        // Live range of 'from' value (s_x) must be before 'next_dest' (d_1);
-        if (!LiveRangeBefore(*src, *next_dest)) {
-          VLOG(2) << "Not removing the copy: live range of "
-                  << src->value->ToShortString() << " is not before "
-                  << next_dest->value->ToShortString();
-          return false;
+      bool values_interfere =
+          use_region_analysis
+              ? ValuesInterfere(src, dest, kMergeFirstDestInSource)
+              : true;
+      for (ValueNode* next_dest = Next(*dest); next_dest != nullptr;
+           next_dest = Next(*next_dest)) {
+        // Live range of (s_x, s_{x-1},...) must be before 'next_dest' (d_1);
+        for (ValueNode* prev_src = src; prev_src != nullptr;
+             prev_src = Prev(*prev_src)) {
+          if (!LiveRangeBefore(*prev_src, *next_dest)) {
+            if (!values_interfere) {
+              VLOG(3) << "1: Interference analysis result is false\n";
+            } else {
+              VLOG(2) << "Not removing the copy: live range of "
+                      << prev_src->value->ToShortString() << " is not before "
+                      << next_dest->value->ToShortString();
+              return false;
+            }
+          }
         }
       }
-      ValueNode* next_src = Next(*src);
-
-      if (next_src != nullptr) {
+      for (ValueNode* next_src = Next(*src); next_src != nullptr;
+           next_src = Next(*next_src)) {
         // Live range of 'last_dest' (d_m) must be before 'next_src' s_{x+1}.
-        ValueNode* last_dest = dest->prev;
-        DCHECK(IsTail(*last_dest));
-        if (!LiveRangeBefore(*last_dest, *next_src)) {
-          VLOG(2) << "Not removing the copy: live range of "
-                  << last_dest->value->ToShortString() << " is not before "
-                  << next_src->value->ToShortString();
-          return false;
+        for (ValueNode* last_dest = dest->prev; last_dest != nullptr;
+             last_dest = Prev(*dest)) {
+          if (!LiveRangeBefore(*last_dest, *next_src)) {
+            if (!values_interfere) {
+              VLOG(3) << "2: Interference analysis result is false\n";
+            } else {
+              VLOG(2) << "Not removing the copy: live range of "
+                      << last_dest->value->ToShortString() << " is not before "
+                      << next_src->value->ToShortString();
+              return false;
+            }
+          }
         }
       }
-
+      VLOG(2) << "Splice dest after source.";
       // Splice in destination buffer values list right after 'src'.
       SpliceAfter(dest, src);
     } else if (IsTail(*src)) {
@@ -789,32 +1242,50 @@ class CopyRemover {
       // ** See comment above in the code handling Case (1).
       VLOG(2) << copy->name() << " copies the last value ("
               << src->value->ToShortString() << ") in its buffer";
+      bool values_interfere =
+          use_region_analysis
+              ? ValuesInterfere(src, dest, kMergeLastSourceInDest)
+              : true;
+      VLOG(2) << "Region-based interference : " << values_interfere << "\n";
 
-      ValueNode* prev_dest = Prev(*dest);
-      // nullptr condition handled above in the first 'if' case.
-      DCHECK(prev_dest != nullptr);
-      ValueNode* first_src = src->next;
-      DCHECK(IsHead(*first_src));
-      if (!LiveRangeBefore(*prev_dest, *first_src)) {
-        // Live range of value d_{y-1} is not before s_0.
-        VLOG(2) << "Not removing the copy: live range of "
-                << prev_dest->value->ToShortString() << " is not before "
-                << first_src->value->ToShortString();
-        return false;
-      }
-      ValueNode* next_dest = Next(*dest);
-      if (next_dest != nullptr) {
-        if (!LiveRangeBefore(*src, *next_dest)) {
-          // Live range of value s_n is not before d_{y+1}.
-          VLOG(2) << "Not removing the copy: live range of "
-                  << src->value->ToShortString() << " is not before "
-                  << next_dest->value->ToShortString();
-          return false;
+      for (ValueNode* next_src = src->next; next_src != nullptr;
+           next_src = Next(*next_src)) {
+        for (ValueNode* prev_dest = Prev(*dest);
+             // nullptr condition handled above in the first 'if' case.
+             prev_dest != nullptr; prev_dest = Prev(*prev_dest)) {
+          if (!LiveRangeBefore(*prev_dest, *next_src)) {
+            // Live range of value d_{y-1} is not before s_0.
+            if (!values_interfere) {
+              VLOG(3) << "3: Interference analysis result is false\n";
+            } else {
+              VLOG(2) << "Not removing the copy: live range of "
+                      << prev_dest->value->ToShortString() << " is not before "
+                      << next_src->value->ToShortString();
+              return false;
+            }
+          }
         }
       }
-
+      for (ValueNode* next_dest = Next(*dest); next_dest != nullptr;
+           next_dest = Next(*next_dest)) {
+        for (ValueNode* prev_src = src; prev_src != nullptr;
+             prev_src = Prev(*prev_src)) {
+          if (!LiveRangeBefore(*prev_src, *next_dest)) {
+            if (!values_interfere) {
+              VLOG(3) << "4: Interference analysis result is false\n";
+            } else {
+              // Live range of value s_n is not before d_{y+1}.
+              VLOG(2) << "Not removing the copy: live range of "
+                      << prev_src->value->ToShortString() << " is not before "
+                      << next_dest->value->ToShortString();
+              return false;
+            }
+          }
+        }
+      }
+      VLOG(2) << "Splice src after prev of dest.";
       // Splice source buffer values list right after 'prev_dest'.
-      SpliceAfter(first_src, prev_dest);
+      SpliceAfter(src->next, Prev(*dest));
     } else {
       VLOG(2) << copy->name()
               << " copies value in middle of source buffer to value in middle "
@@ -880,9 +1351,9 @@ class CopyRemover {
       VLOG(2) << "Empty uses for " << *a.value;
       return ordering_.IsDefinedBefore(*a.value, *b.value);
     }
-    return absl::c_all_of(a.uses, [&](const HloUse* use) {
-      return ordering_.UseIsBeforeValueDefinition(*use, *b.value, dataflow_);
-    });
+    VLOG(3) << "Checking live ranges before :" << ValueListToString(&a)
+            << " vs " << ValueListToString(&b) << "\n";
+    return ordering_.UsesBeforeValueDefinition(a.uses, *b.value, dataflow_);
   }
 
   // Returns whether 'node' is the last node in its list.
@@ -929,15 +1400,88 @@ class CopyRemover {
     head->prev = insert_after;
   }
 
-  string ValueListToString(const ValueNode* element) {
-    const ValueNode* head = element;
-    while (!IsHead(*head)) {
-      head = Prev(*head);
+  enum CombineLiveRangeOption {
+    kMergeFirstDestInSource = 1,
+    kMergeLastSourceInDest = 2
+  };
+  // This function analyzes all the HloValues that have been grouped together
+  // with src to share a single buffer, and all the HloValues that have been
+  // similarly grouped together with dest, to determine whether these two groups
+  // can be combined, by removing the operation in dest, which makes a copy of
+  // the buffer in src.
+  bool ValuesInterfere(absl::Span<const HloValue* const> src_values,
+                       absl::Span<const HloValue* const> dest_values,
+                       CombineLiveRangeOption merge_location) {
+    auto src_live_range = ComputeLiveRangeRegions(src_values);
+    auto dest_live_range = ComputeLiveRangeRegions(dest_values);
+    ComputeRelativeLocation relative_location_analysis(ordering_);
+    auto rel1 =
+        relative_location_analysis.Compute(src_live_range, dest_live_range);
+    VLOG(3) << "Location of dest in relation to src:" << rel1.ToString()
+            << " with interception set to " << rel1.InterceptDefUse() << "\n";
+    auto rel2 =
+        relative_location_analysis.Compute(dest_live_range, src_live_range);
+    VLOG(3) << "Location of src in relation to dest:" << rel2.ToString()
+            << " with interception set to " << rel1.InterceptDefUse() << "\n";
+    // If src and dest are interleaved with each other, they interfere.
+    if (rel1.RuntimeOrderOverlap() && rel2.RuntimeOrderOverlap()) {
+      VLOG(3) << "Both relations are overlap.\n";
+      return true;
     }
+    // If src and dest belong to the same group of computations and do not
+    // overlap, they do not interfere.
+    if (!rel1.RuntimeOrderOverlap() && !rel2.RuntimeOrderOverlap()) {
+      VLOG(3) << "Neither relation is overlap.\n";
+      return false;
+    }
+
+    if (!rel2.RuntimeOrderOverlap()) {
+      CHECK(rel1.RuntimeOrderOverlap());
+      VLOG(3) << "rel1 is overlap, with interception = "
+              << rel1.InterceptDefUse() << "\n";
+      return rel1.InterceptDefUse() ||
+             (merge_location != kMergeFirstDestInSource &&
+              rel2.InterceptDefUse());
+    } else {
+      CHECK(!rel1.RuntimeOrderOverlap());
+      VLOG(3) << "rel2 is overlap, with interception = "
+              << rel2.InterceptDefUse() << "\n";
+      // Here src is at the end of a nested computation inside dest.
+      return rel2.InterceptDefUse() ||
+             (merge_location != kMergeLastSourceInDest &&
+              rel1.InterceptDefUse());
+    }
+    return true;
+  }
+
+  bool ValuesInterfere(const ValueNode* src, const ValueNode* dest,
+                       CombineLiveRangeOption merge_location) {
+    // Get the entire range of values sharing the buffers in src and dest.
+    auto src_values = GetValueList(src);
+    auto dest_values = GetValueList(dest);
+    return ValuesInterfere(src_values, dest_values, merge_location);
+  }
+
+  // return the sequence of HloValues starting from element.
+  // If element is not head, traverse from element to tail, then wrap around.
+  // The ordering is important for live range region analysis.
+  std::vector<const HloValue*> GetValueList(const ValueNode* element) {
+    const ValueNode* head = element;
     std::vector<const HloValue*> values;
     for (const ValueNode* p = head; p != nullptr; p = Next(*p)) {
       values.push_back(p->value);
     }
+    while (!IsHead(*head)) {
+      head = Prev(*head);
+    }
+    for (const ValueNode* p = head; p != element; p = Next(*p)) {
+      values.push_back(p->value);
+    }
+    return values;
+  }
+
+  string ValueListToString(const ValueNode* element) {
+    auto values = GetValueList(element);
     return absl::StrCat("{",
                         absl::StrJoin(values, ", ",
                                       [](string* s, const HloValue* value) {
@@ -998,6 +1542,36 @@ class CopyRemover {
 };
 
 }  // namespace
+
+// We add copies for all non-phi indices of the true and false computation
+// roots, in order to resolve interference. We later rely on
+// RemoveUnnecessaryCopies to drop the unnecessary ones.
+Status CopyInsertion::AddCopiesForConditional(
+    const HloAliasAnalysis& alias_analysis, HloInstruction* conditional) {
+  VLOG(2) << "Adding copies for kConditional instruction "
+          << conditional->name();
+  ShapeTree<bool> indices_to_copy(conditional->shape());
+  TF_RET_CHECK(conditional->opcode() == HloOpcode::kConditional);
+  if (!IndicesToCopyForConditional(alias_analysis.dataflow_analysis(),
+                                   conditional, &indices_to_copy)) {
+    VLOG(2) << "No copies necessary for kWhile instruction "
+            << conditional->name();
+    return Status::OK();
+  }
+
+  for (HloComputation* computation : conditional->branch_computations()) {
+    HloInstruction* root = computation->root_instruction();
+    std::vector<HloInstruction*> users = root->users();
+    TF_ASSIGN_OR_RETURN(
+        HloInstruction * deep_copy,
+        computation->DeepCopyInstruction(root, &indices_to_copy));
+    for (HloInstruction* user : users) {
+      TF_RETURN_IF_ERROR(root->ReplaceUseWith(user, deep_copy));
+    }
+    computation->set_root_instruction(deep_copy);
+  }
+  return Status::OK();
+}
 
 // Add kCopy instructions to the given module to guarantee there is no
 // live-range interference. Generally interference can only occur around kWhile
@@ -1167,12 +1741,14 @@ static int64 GetNumExistingCopies(const HloModule* module) {
 }
 
 Status CopyInsertion::RemoveUnnecessaryCopies(const HloOrdering& ordering,
-                                              HloModule* module) {
+                                              HloModule* module,
+                                              bool check_live_range_ordering) {
   XLA_VLOG_LINES(4, module->ToString());
   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloAliasAnalysis> alias_analysis,
                       HloAliasAnalysis::Run(module, can_share_buffer_));
 
-  CopyRemover copy_remover(*module, *alias_analysis, ordering);
+  CopyRemover copy_remover(*module, *alias_analysis, ordering,
+                           check_live_range_ordering);
   if (VLOG_IS_ON(3)) {
     LOG(INFO) << "Removing unnecessary copies in " << module->name();
     LOG(INFO) << "Buffer values, in dependency order: ";
@@ -1192,9 +1768,12 @@ Status CopyInsertion::RemoveUnnecessaryCopies(const HloOrdering& ordering,
     VLOG(2) << "Running fixpoint iteration " << num_iterations
             << " of copy elision";
     for (HloComputation* computation : module->computations()) {
+      VLOG(2) << "computation:" << computation->name() << "\n";
       for (HloInstruction* instruction : computation->instructions()) {
+        VLOG(2) << instruction->ToString() << "\n";
         if (instruction->opcode() == HloOpcode::kCopy &&
-            copy_remover.TryElideCopy(instruction)) {
+            copy_remover.TryElideCopy(instruction,
+                                      use_region_based_live_range_analysis_)) {
           changed = true;
           TF_RETURN_IF_ERROR(StripControlDependenciesFrom(instruction));
           TF_RETURN_IF_ERROR(
@@ -1252,7 +1831,8 @@ StatusOr<bool> CopyInsertion::Run(HloModule* module) {
       name(), "after adding copies to resolve interference", *module);
 
   TF_RETURN_IF_ERROR(
-      RemoveUnnecessaryCopies(DependencyHloOrdering(module), module));
+      RemoveUnnecessaryCopies(DependencyHloOrdering(module), module,
+                              /*check_live_range_ordering=*/true));
   DumpHloModuleDuringPassIfEnabled(name(), "after removing unnecessary copies",
                                    *module);
   TF_RETURN_IF_ERROR(AddSpecialCaseCopies(*call_graph, module));

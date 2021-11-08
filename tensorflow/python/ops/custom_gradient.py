@@ -42,10 +42,6 @@ VAR_OP_TYPES = [
 ]
 
 
-# TODO(allenl): Remove this alias and migrate callers.
-copy_handle_data = handle_data_util.copy_handle_data
-
-
 @tf_export("custom_gradient")
 def custom_gradient(f=None):
   """Decorator to define a function with a custom gradient.
@@ -68,7 +64,7 @@ def custom_gradient(f=None):
   ```python
   x = tf.constant(100.)
   y = log1pexp(x)
-  dy = tf.gradients(y, x) # Will be NaN when evaluated.
+  dy_dx = tf.gradients(y, x) # Will be NaN when evaluated.
   ```
 
   The gradient expression can be analytically simplified to provide numerical
@@ -78,26 +74,29 @@ def custom_gradient(f=None):
   @tf.custom_gradient
   def log1pexp(x):
     e = tf.exp(x)
-    def grad(dy):
-      return dy * (1 - 1 / (1 + e))
+    def grad(upstream):
+      return upstream * (1 - 1 / (1 + e))
     return tf.math.log(1 + e), grad
   ```
 
-  With this definition, the gradient at x=100 will be correctly evaluated as
-  1.0.
+  With this definition, the gradient `dy_dx` at `x = 100` will be correctly
+  evaluated as 1.0.
 
-  The variable `dy` is defined as the upstream gradient. i.e. the gradient from
-  all the layers or functions originating from this layer.
+  The variable `upstream` is defined as the upstream gradient. i.e. the gradient
+  from all the layers or functions originating from this layer. The above
+  example has no upstream functions, therefore `upstream = dy/dy = 1.0`.
 
-  By chain rule we know that
-  `dy/dx = dy/x_0 * dx_0/dx_1 * ... * dx_i/dx_i+1 * ... * dx_n/dx`
+  Assume that `x_i` is `log1pexp` in the forward pass `x_1 = x_1(x_0)`,
+  `x_2 = x_2(x_1)`, ..., `x_i = x_i(x_i-1)`, ..., `x_n = x_n(x_n-1)`. By
+  chain rule we know that `dx_n/dx_0 = dx_n/dx_n-1 * dx_n-1/dx_n-2 * ... *
+  dx_i/dx_i-1 * ... * dx_1/dx_0`.
 
-  In this case the gradient of our current function defined as 
-  `dx_i/dx_i+1 = (1 - 1 / (1 + e))`. The upstream gradient `dy` would be
-  `dx_i+1/dx_i+2 * dx_i+2/dx_i+3 * ... * dx_n/dx`. The upstream gradient 
+  In this case the gradient of our current function defined as
+  `dx_i/dx_i-1 = (1 - 1 / (1 + e))`. The upstream gradient `upstream` would be
+  `dx_n/dx_n-1 * dx_n-1/dx_n-2 * ... * dx_i+1/dx_i`. The upstream gradient
   multiplied by the current gradient is then passed downstream.
 
-  In case the function takes multiple variables as input, the `grad` 
+  In case the function takes multiple variables as input, the `grad`
   function must also return  the same number of variables.
   We take the function `z = x * y` as an example.
 
@@ -161,6 +160,55 @@ def custom_gradient(f=None):
 
   Additional arguments to the inner `@tf.custom_gradient`-decorated function
   control the expected return values of the innermost function.
+
+  The examples above illustrate how to specify custom gradients for functions
+  which do not read from variables. The following example uses variables, which
+  require special handling because they are effectively inputs of the forward
+  function.
+
+  >>> weights = tf.Variable(tf.ones([2]))  # Trainable variable weights
+  >>> @tf.custom_gradient
+  ... def linear_poly(x):
+  ...   # Creating polynomial
+  ...   poly = weights[1] * x + weights[0]
+  ...
+  ...   def grad_fn(dpoly, variables):
+  ...     # dy/dx = weights[1] and we need to left multiply dpoly
+  ...     grad_xs = dpoly * weights[1]  # Scalar gradient
+  ...
+  ...     grad_vars = []  # To store gradients of passed variables
+  ...     assert variables is not None
+  ...     assert len(variables) == 1
+  ...     assert variables[0] is weights
+  ...     # Manually computing dy/dweights
+  ...     dy_dw = dpoly * tf.stack([x ** 1, x ** 0])
+  ...     grad_vars.append(
+  ...         tf.reduce_sum(tf.reshape(dy_dw, [2, -1]), axis=1)
+  ...     )
+  ...     return grad_xs, grad_vars
+  ...   return poly, grad_fn
+  >>> x = tf.constant([1., 2., 3.])
+  >>> with tf.GradientTape(persistent=True) as tape:
+  ...   tape.watch(x)
+  ...   poly = linear_poly(x)
+  >>> poly # poly = x + 1
+  <tf.Tensor: shape=(3,),
+    dtype=float32,
+    numpy=array([2., 3., 4.], dtype=float32)>
+  >>> tape.gradient(poly, x)  # conventional scalar gradient dy/dx
+  <tf.Tensor: shape=(3,),
+    dtype=float32,
+    numpy=array([1., 1., 1.], dtype=float32)>
+  >>> tape.gradient(poly, weights)
+  <tf.Tensor: shape=(2,), dtype=float32, numpy=array([6., 3.], dtype=float32)>
+
+  Above example illustrates usage of trainable variable `weights`.
+  In the example, the inner `grad_fn` accepts an extra `variables` input
+  parameter and also returns an extra `grad_vars` output. That extra argument
+  is passed if the forward function reads any variables. You need to
+  compute the gradient w.r.t. each of those `variables` and output it as a list
+  of `grad_vars`. Note here that default value of `variables` is set to `None`
+  when no variables are used in the forward function.
 
   See also `tf.RegisterGradient` which registers a gradient function for a
   primitive TensorFlow operation. `tf.custom_gradient` on the other hand allows
@@ -309,6 +357,10 @@ def _get_dependent_variables(input_ops, output_ops):
   return tf_vars
 
 
+def generate_name():
+  return "CustomGradient-%s" % ops.uid()
+
+
 def _graph_mode_decorator(f, args, kwargs):
   """Implement custom gradient decorator for graph mode."""
   # TODO(rsepassi): Add support for kwargs
@@ -316,7 +368,7 @@ def _graph_mode_decorator(f, args, kwargs):
     raise ValueError(
         "The custom_gradient decorator currently supports keywords "
         "arguments only when eager execution is enabled.")
-  name = "CustomGradient-%s" % ops.uid()
+  name = generate_name()
   args = nest.map_structure(ops.convert_to_tensor, args)
 
   # Checking global and local variables attempts to ensure that no non-resource
@@ -373,8 +425,9 @@ def _graph_mode_decorator(f, args, kwargs):
       v.ref() for v in _get_dependent_variables(
           input_ops=filtered_input_tensors, output_ops=flat_result)
   ])
-  variables = list(
-      [v.deref() for v in variables_in_subgraph.union(variables_in_tape)])
+  variables = sorted(
+      [v.deref() for v in variables_in_subgraph.union(variables_in_tape)],
+      key=lambda v: v.name)
 
   grad_argspec = tf_inspect.getfullargspec(grad_fn)
   variables_in_signature = ("variables" in grad_argspec.args or
@@ -427,7 +480,7 @@ def _graph_mode_decorator(f, args, kwargs):
   tape_lib.record_operation(
       f.__name__, all_tensors, original_tensors, tape_grad_fn)
   for ot, t in zip(original_tensors, all_tensors):
-    copy_handle_data(ot, t)
+    handle_data_util.copy_handle_data(ot, t)
   return nest.pack_sequence_as(
       structure=result, flat_sequence=all_tensors[:flat_result_len])
 

@@ -168,7 +168,7 @@ Status TransposeShapeFn(InferenceContext* c) {
 
     for (int32 i = 0; i < rank; ++i) {
       int64 in_idx = data[i];
-      if (in_idx >= rank) {
+      if (in_idx >= rank || in_idx <= -rank) {
         return errors::InvalidArgument("perm dim ", in_idx,
                                        " is out of range of input rank ", rank);
       }
@@ -680,6 +680,12 @@ REGISTER_OP("SplitV")
           if (data[i] == -1 && c->ValueKnown(split_dim_size)) {
             size = split_dim_size - total_size;
           }
+          // If we have a negative known size (either explicit, or computed
+          // via -1), then the split sizes are invalid.
+          if (size < -1 || (size == -1 && c->ValueKnown(split_dim_size))) {
+            return errors::InvalidArgument("Split size at index ", i,
+                                           " must be >= 0. Got: ", size);
+          }
           TF_RETURN_IF_ERROR(
               c->ReplaceDim(input, split_dim, c->MakeDim(size), &output_shape));
           c->set_output(i, output_shape);
@@ -725,6 +731,16 @@ REGISTER_OP("HostConst")
     .Attr("value: tensor")
     .Attr("dtype: type")
     .SetShapeFn(shape_inference::UnknownShape);
+
+// Used executing op-by-op to copy constants to the current device without
+// serializing tensors as TensorProtos, after a host tensor has been
+// created. Same behavior as Identity, but no gradient and potentially relaxed
+// copy semantics.
+REGISTER_OP("_EagerConst")
+    .Input("input: T")
+    .Output("output: T")
+    .Attr("T: type")
+    .SetShapeFn(shape_inference::UnchangedShape);
 
 // --------------------------------------------------------------------------
 // TODO(mgubin): Update the doc when the freeze_graph script supports converting
@@ -965,8 +981,8 @@ REGISTER_OP("Reverse")
     .Input("dims: bool")
     .Output("output: T")
     .Attr(
-        "T: {uint8, int8, uint16, int16, int32, int64, bool, half, "
-        "float, double, complex64, complex128, string}")
+        "T: {uint8, int8, uint16, int16, uint32, int32, uint64, int64, bool, "
+        "bfloat16, half, float, double, complex64, complex128, string}")
     .SetShapeFn([](InferenceContext* c) {
       ShapeHandle input = c->input(0);
       ShapeHandle dims;
@@ -990,8 +1006,8 @@ REGISTER_OP("ReverseV2")
     .Output("output: T")
     .Attr("Tidx: {int32, int64} = DT_INT32")
     .Attr(
-        "T: {uint8, int8, uint16, int16, int32, int64, bool, bfloat16, half, "
-        "float, double, complex64, complex128, string}")
+        "T: {uint8, int8, uint16, int16, int32, uint32, int64, uint64, bool, "
+        "bfloat16, half, float, double, complex64, complex128, string}")
     .SetShapeFn([](InferenceContext* c) {
       ShapeHandle input = c->input(0);
       ShapeHandle axis;
@@ -2841,7 +2857,10 @@ REGISTER_OP("QuantizeAndDequantizeV2")
       ShapeHandle minmax;
       TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
       TF_RETURN_IF_ERROR(c->Merge(c->input(2), minmax, &minmax));
-      if (axis != -1) {
+      if (axis < -1) {
+        return errors::InvalidArgument("axis should be at least -1, got ",
+                                       axis);
+      } else if (axis != -1) {
         ShapeHandle input;
         TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
         DimensionHandle depth;
@@ -2873,7 +2892,10 @@ REGISTER_OP("QuantizeAndDequantizeV4")
       ShapeHandle minmax;
       TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
       TF_RETURN_IF_ERROR(c->Merge(c->input(2), minmax, &minmax));
-      if (axis != -1) {
+      if (axis < -1) {
+        return errors::InvalidArgument("axis should be at least -1, got ",
+                                       axis);
+      } else if (axis != -1) {
         ShapeHandle input;
         TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
         DimensionHandle depth;
@@ -2901,7 +2923,10 @@ REGISTER_OP("QuantizeAndDequantizeV4Grad")
       ShapeHandle minmax;
       TF_RETURN_IF_ERROR(c->WithRank(c->input(2), minmax_rank, &minmax));
       TF_RETURN_IF_ERROR(c->Merge(c->input(3), minmax, &minmax));
-      if (axis != -1) {
+      if (axis < -1) {
+        return errors::InvalidArgument("axis should be at least -1, got ",
+                                       axis);
+      } else if (axis != -1) {
         ShapeHandle input;
         TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
         DimensionHandle depth;
@@ -2934,7 +2959,10 @@ REGISTER_OP("QuantizeAndDequantizeV3")
       ShapeHandle minmax;
       TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
       TF_RETURN_IF_ERROR(c->Merge(c->input(2), minmax, &minmax));
-      if (axis != -1) {
+      if (axis < -1) {
+        return errors::InvalidArgument("axis should be at least -1, got ",
+                                       axis);
+      } else if (axis != -1) {
         ShapeHandle input;
         TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
         DimensionHandle depth;
@@ -2962,28 +2990,7 @@ REGISTER_OP("QuantizeV2")
     .Attr("narrow_range: bool = false")
     .Attr("axis: int = -1")
     .Attr("ensure_minimum_range: float = 0.01")
-    .SetShapeFn([](InferenceContext* c) {
-      int axis = -1;
-      Status s = c->GetAttr("axis", &axis);
-      if (!s.ok() && s.code() != error::NOT_FOUND) {
-        return s;
-      }
-      const int minmax_rank = (axis == -1) ? 0 : 1;
-      TF_RETURN_IF_ERROR(shape_inference::UnchangedShape(c));
-      ShapeHandle minmax;
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), minmax_rank, &minmax));
-      if (axis != -1) {
-        ShapeHandle input;
-        TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
-        DimensionHandle depth;
-        TF_RETURN_IF_ERROR(
-            c->Merge(c->Dim(minmax, 0), c->Dim(input, axis), &depth));
-      }
-      c->set_output(1, minmax);
-      c->set_output(2, minmax);
-      return Status::OK();
-    });
+    .SetShapeFn(shape_inference::QuantizeV2Shape);
 
 REGISTER_OP("Dequantize")
     .Input("input: T")
@@ -3000,6 +3007,10 @@ REGISTER_OP("Dequantize")
       Status s = c->GetAttr("axis", &axis);
       if (!s.ok() && s.code() != error::NOT_FOUND) {
         return s;
+      }
+      if (axis < -1) {
+        return errors::InvalidArgument("axis should be at least -1, got ",
+                                       axis);
       }
       const int minmax_rank = (axis == -1) ? 0 : 1;
       TF_RETURN_IF_ERROR(shape_inference::UnchangedShape(c));

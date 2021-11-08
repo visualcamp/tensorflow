@@ -23,10 +23,8 @@ limitations under the License.
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
-#include "mlir/Dialect/Linalg/EDSC/Intrinsics.h"  // from @llvm-project
 #include "mlir/Dialect/Linalg/Transforms/CodegenStrategy.h"  // from @llvm-project
-#include "mlir/Dialect/StandardOps/EDSC/Intrinsics.h"  // from @llvm-project
-#include "mlir/EDSC/Builders.h"  // from @llvm-project
+#include "mlir/Dialect/StandardOps/Utils/Utils.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
 #include "mlir/IR/BuiltinOps.h"  // from @llvm-project
 #include "mlir/IR/MLIRContext.h"  // from @llvm-project
@@ -273,7 +271,6 @@ Status DotOpEmitter::EmitLinalgMatmul() {
         CHECK_EQ(dot_info_.dim_nums.lhs_contracting_dimensions_size(), 1);
         CHECK_EQ(dot_info_.dim_nums.rhs_contracting_dimensions_size(), 1);
         mlir::MLIRContext* context = builder->getContext();
-        mlir::edsc::ScopedContext scope(*builder, function.getLoc());
         mlir::Value a = function.getArgument(0), b = function.getArgument(1),
                     c = function.getArgument(2);
 
@@ -304,18 +301,24 @@ Status DotOpEmitter::EmitLinalgMatmul() {
           }
         }
 
-        llvm::SmallVector<mlir::IteratorType, 4> iteratorTypes(
-            parallel_exprs.size(), mlir::IteratorType::Parallel);
-        iteratorTypes.push_back(mlir::IteratorType::Reduction);
-
-        mlir::edsc::StructuredIndexed s_a(a), s_b(b), s_c(c);
-        mlir::edsc::makeGenericLinalgOp(
+        llvm::SmallVector<llvm::StringRef, 4> iteratorTypes(
+            parallel_exprs.size(), toString(mlir::IteratorType::Parallel));
+        iteratorTypes.push_back(toString(mlir::IteratorType::Reduction));
+        builder->create<mlir::linalg::GenericOp>(
+            function.getLoc(),
+            /*inputs=*/mlir::ValueRange{b, c},
+            /*outputs=*/mlir::ValueRange{a},
+            /*indexingMaps=*/
+            mlir::AffineMap::inferFromExprList(
+                {b_exprs, c_exprs, parallel_exprs}),
             /*iteratorTypes=*/iteratorTypes,
-            /*inputs=*/{s_b(b_exprs), s_c(c_exprs)},
-            /*outputBuffers=*/{s_a(parallel_exprs)},
-            /*initTensors=*/{},
-            /*resultTensorTypes=*/{}, mlir::edsc::ops::macRegionBuilder);
-        mlir::edsc::intrinsics::std_ret();
+            [](mlir::OpBuilder& b, mlir::Location loc, mlir::ValueRange args) {
+              mlir::ArithBuilder ab(b, loc);
+              mlir::Value mul = ab.mul(args[0], args[1]);
+              mlir::Value add = ab.add(mul, args[2]);
+              b.create<mlir::linalg::YieldOp>(loc, add);
+            });
+        builder->create<mlir::ReturnOp>(function.getLoc());
 
         mlir::linalg::LinalgTilingOptions tilingOptions;
         tilingOptions = tilingOptions.setTileSizes(GetMlirGemmTileSize());
@@ -652,6 +655,9 @@ void DotOpEmitter::EmitNaiveLlvmIrGemm() {
   } else if (ShapeUtil::ElementIsIntegral(lhs_shape)) {
     llvm::Value* product = b_->CreateMul(lhs_element, rhs_element);
     updated_accum = b_->CreateAdd(accum, product);
+  } else if (lhs_shape.element_type() == PRED) {
+    llvm::Value* product = b_->CreateAnd(lhs_element, rhs_element);
+    updated_accum = b_->CreateOr(accum, product);
   } else {
     llvm::Value* product = b_->CreateFMul(lhs_element, rhs_element);
     updated_accum = b_->CreateFAdd(accum, product);
@@ -1026,7 +1032,7 @@ DotImplementationStrategy GetDotImplementationStrategy(
 
   if (IsAlignedGemm(dot_info, target_machine_features)) {
     if (CanEmitTiledLlvmIrGemm(config, dot_info, target_machine_features)) {
-      return DotImplementationStrategy::kLinalgMatmul;
+      return DotImplementationStrategy::kTiledLlvmIrGemm;
     }
     return DotImplementationStrategy::kEigen;
   }
@@ -1042,7 +1048,9 @@ Status EmitNonBatchDotOperation(
     mlir::MLIRContext* mlir_context, const HloModuleConfig& hlo_module_config,
     const TargetMachineFeatures& target_machine_features) {
   PrimitiveType type = target_array.GetShape().element_type();
-  TF_RET_CHECK(S32 == type || F16 == type || F32 == type || F64 == type ||
+  TF_RET_CHECK(PRED == type || S8 == type || U8 == type || S16 == type ||
+               U16 == type || S32 == type || U32 == type || S64 == type ||
+               U64 == type || F16 == type || F32 == type || F64 == type ||
                C64 == type || C128 == type);
   DotOpEmitter dot_emitter(std::move(dot_info), std::move(hlo_name),
                            target_array, lhs_array, rhs_array, addend_array,

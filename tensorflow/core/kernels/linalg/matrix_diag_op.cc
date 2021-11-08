@@ -73,6 +73,9 @@ class MatrixDiagPartOp : public OpKernel {
                   errors::InvalidArgument(
                       "diag_index must be a scalar or vector, received shape: ",
                       diag_index.shape().DebugString()));
+      OP_REQUIRES(context, diag_index.NumElements() > 0,
+                  errors::InvalidArgument(
+                      "Expected diag_index to have at least 1 element"));
       lower_diag_index = diag_index.flat<int32>()(0);
       upper_diag_index = lower_diag_index;
       if (TensorShapeUtils::IsVector(diag_index.shape())) {
@@ -86,7 +89,10 @@ class MatrixDiagPartOp : public OpKernel {
           upper_diag_index = diag_index.flat<int32>()(1);
         }
       }
-      padding_value = context->input(2).flat<T>()(0);
+      const Tensor& padding_in = context->input(2);
+      OP_REQUIRES(context, padding_in.NumElements() == 1,
+                  errors::InvalidArgument("Padding must be scalar."));
+      padding_value = padding_in.flat<T>()(0);
     }
     const TensorShape& input_shape = input.shape();
 
@@ -179,6 +185,9 @@ class MatrixDiagOp : public OpKernel {
                   errors::InvalidArgument(
                       "diag_index must be a scalar or vector, received shape: ",
                       diag_index.shape().DebugString()));
+      OP_REQUIRES(context, diag_index.NumElements() > 0,
+                  errors::InvalidArgument(
+                      "Expected diag_index to have at least 1 element"));
       lower_diag_index = diag_index.flat<int32>()(0);
       upper_diag_index = lower_diag_index;
       if (TensorShapeUtils::IsVector(diag_index.shape())) {
@@ -192,9 +201,22 @@ class MatrixDiagOp : public OpKernel {
           upper_diag_index = diag_index.flat<int32>()(1);
         }
       }
-      num_rows = context->input(2).flat<int32>()(0);
-      num_cols = context->input(3).flat<int32>()(0);
-      padding_value = context->input(4).flat<T>()(0);
+
+      auto& num_rows_tensor = context->input(2);
+      OP_REQUIRES(context, TensorShapeUtils::IsScalar(num_rows_tensor.shape()),
+                  errors::InvalidArgument("num_rows must be a scalar"));
+      num_rows = num_rows_tensor.flat<int32>()(0);
+
+      auto& num_cols_tensor = context->input(3);
+      OP_REQUIRES(context, TensorShapeUtils::IsScalar(num_cols_tensor.shape()),
+                  errors::InvalidArgument("num_cols must be a scalar"));
+      num_cols = num_cols_tensor.flat<int32>()(0);
+
+      auto& padding_value_tensor = context->input(4);
+      OP_REQUIRES(context,
+                  TensorShapeUtils::IsScalar(padding_value_tensor.shape()),
+                  errors::InvalidArgument("padding_value must be a scalar"));
+      padding_value = padding_value_tensor.flat<T>()(0);
     }
 
     // Size validations.

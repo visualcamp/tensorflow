@@ -139,11 +139,6 @@ class RaggedDispatchTest(test_util.TensorFlowTestCase, parameterized.TestCase):
       ]
       )  # pyformat: disable
   def testUnaryElementwiseOp(self, x, op=math_ops.abs, **extra_args):
-    if test_util.IsBuiltWithROCm():
-      # TODO(rocm):
-      # This fails on ROCm...see JIRA ticket 236756
-      self.skipTest('Fails on ROCM')
-
     result = op(x, **extra_args)
 
     # Run the wrapped op on the dense values, for comparison.
@@ -319,7 +314,9 @@ class RaggedDispatchTest(test_util.TensorFlowTestCase, parameterized.TestCase):
                ragged_factory_ops.constant_value([['foo', 'bar'], ['baz']]),
                ragged_factory_ops.constant_value([['2', '9'], ['12']]))},
       ])  # pyformat: disable
-  def testListValuedElementwiseOp(self, inputs, op=math_ops.add_n,
+  def testListValuedElementwiseOp(self,
+                                  inputs,
+                                  op=math_ops.add_n,
                                   **extra_args):
     use_kwargs = extra_args.pop('use_kwargs', False)
     if use_kwargs:
@@ -590,6 +587,24 @@ class RaggedDispatchTest(test_util.TensorFlowTestCase, parameterized.TestCase):
           },
           expected=[2, 4]),
       dict(
+          op=math_ops.reduce_variance,
+          kwargs={
+              'input_tensor':
+                  ragged_factory_ops.constant_value([[1, 3], [3, 6, 9]]),
+              'axis':
+                  1
+          },
+          expected=[1., 6.]),
+      dict(
+          op=math_ops.reduce_std,
+          kwargs={
+              'input_tensor':
+                  ragged_factory_ops.constant_value([[1, 3], [1, 2, 2, 1]]),
+              'axis':
+                  1
+          },
+          expected=[1., 0.5]),
+      dict(
           op=math_ops.reduce_any,
           kwargs={
               'input_tensor':
@@ -599,6 +614,13 @@ class RaggedDispatchTest(test_util.TensorFlowTestCase, parameterized.TestCase):
                   1
           },
           expected=[True, True]),
+      dict(
+          op=math_ops.matmul,
+          kwargs={
+              'a': ragged_factory_ops.constant_value([[1, 2, 3], [4, 5, 6]]),
+              'b': ragged_factory_ops.constant_value([[5], [4], [3]])
+          },
+          expected=[[22], [58]]),
       dict(
           op=string_ops.reduce_join,
           kwargs={
@@ -676,13 +698,20 @@ class RaggedDispatchTest(test_util.TensorFlowTestCase, parameterized.TestCase):
           expected=ragged_factory_ops.constant_value([[5, 4], [3, 2, 1]])),
       dict(
           op=string_ops.string_format,
-          kwargs={'template': 'Hi {}',
-                  'inputs': [ragged_factory_ops.constant_value([[1, 2], [3]])]},
+          kwargs={
+              'template': 'Hi {}',
+              'inputs': [ragged_factory_ops.constant_value([[1, 2], [3]])]
+          },
           expected='Hi [[1, 2], [3]]'),
   ])
-  def testRaggedDispatch(self, op, expected, args=(), result_is_list=False,
+  def testRaggedDispatch(self,
+                         op,
+                         expected,
+                         args=(),
+                         result_is_list=False,
                          kwargs=None):
-    if kwargs is None: kwargs = {}
+    if kwargs is None:
+      kwargs = {}
     result = op(*args, **kwargs)
     if result_is_list:
       self.assertLen(result, len(expected))
@@ -694,15 +723,13 @@ class RaggedDispatchTest(test_util.TensorFlowTestCase, parameterized.TestCase):
   def testUnaryElementwiseOpsPreserveUniformRowLength(self):
     # Unary elementwise op
     rt = ragged_tensor.RaggedTensor.from_uniform_row_length(
-        ragged_factory_ops.constant([[1, 2], [3]]),
-        uniform_row_length=2)
+        ragged_factory_ops.constant([[1, 2], [3]]), uniform_row_length=2)
     self.assertAllEqual(rt.uniform_row_length,
                         array_ops.zeros_like(rt).uniform_row_length)
 
     # Unary-list elementwise op
     rt = ragged_tensor.RaggedTensor.from_uniform_row_length(
-        ragged_factory_ops.constant([[1, 2], [3]]),
-        uniform_row_length=2)
+        ragged_factory_ops.constant([[1, 2], [3]]), uniform_row_length=2)
     self.assertAllEqual(rt.uniform_row_length,
                         math_ops.add_n([rt, rt]).uniform_row_length)
 
@@ -727,8 +754,9 @@ class RaggedDispatchTest(test_util.TensorFlowTestCase, parameterized.TestCase):
         'math.maximum', 'math.minimum', 'math.multiply', 'math.negative',
         'math.not_equal', 'math.pow', 'math.real', 'math.reciprocal',
         'math.reduce_any', 'math.reduce_max', 'math.reduce_mean',
-        'math.reduce_min', 'math.reduce_prod', 'math.reduce_sum', 'math.rint',
-        'math.round', 'math.rsqrt', 'math.sign', 'math.sin', 'math.sinh',
+        'math.reduce_variance', 'math.reduce_std', 'math.reduce_min',
+        'math.reduce_prod', 'math.reduce_sum', 'math.rint', 'math.round',
+        'math.rsqrt', 'math.sign', 'math.sigmoid', 'math.sin', 'math.sinh',
         'math.sqrt', 'math.square', 'math.squared_difference', 'math.subtract',
         'math.tan', 'math.truediv', 'math.unsorted_segment_max',
         'math.unsorted_segment_mean', 'math.unsorted_segment_min',
